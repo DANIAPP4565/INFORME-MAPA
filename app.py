@@ -217,18 +217,22 @@ def parse_mapa_pdf(pdf_file):
 
             raw_text = "\n".join(pages_text)
 
-        # Strategy 1: table extraction
-        df = _parse_from_tables(all_tables)
-        # Strategy 2: aggressive text parsing
+        # IMPORTANTE: para el informe se ignoran los datos/resúmenes del PDF original.
+        # Sólo se usan lecturas crudas de la tabla completa o lecturas válidas.
+        raw_readings_text = _isolate_lecturas_validas_text(raw_text)
+
+        # Strategy 1: aggressive text parsing sobre la tabla de lecturas crudas
+        df = _parse_from_text_v2(raw_readings_text)
+        # Strategy 2: column-based extraction (fixed-width) sobre lecturas crudas
         if df is None or len(df) < 5:
-            df2 = _parse_from_text_v2(raw_text)
-            if df2 is not None and len(df2) > (len(df) if df is not None else 0):
-                df = df2
-        # Strategy 3: column-based extraction (fixed-width)
-        if df is None or len(df) < 5:
-            df3 = _parse_fixed_width(raw_text)
+            df3 = _parse_fixed_width(raw_readings_text)
             if df3 is not None and len(df3) > (len(df) if df is not None else 0):
                 df = df3
+        # Strategy 3: table extraction como respaldo, sin usar estadísticas/promedios
+        if df is None or len(df) < 5:
+            df_tbl = _parse_from_tables(all_tables)
+            if df_tbl is not None and len(df_tbl) > (len(df) if df is not None else 0):
+                df = df_tbl
 
         if df is None or len(df) < 3:
             return None, "No se pudieron extraer lecturas del PDF.", raw_text
@@ -395,6 +399,30 @@ def _extract_meta(text):
         if sz.lower() in text.lower():
             meta['manguito'] = sz; break
     return meta
+
+
+def _isolate_lecturas_validas_text(text):
+    """
+    Prioriza la sección de lecturas crudas/tabla completa y descarta portadas,
+    estadísticas, promedios horarios y resúmenes del PDF original. Esto evita
+    que el informe use promedios ya calculados por el software del equipo.
+    """
+    if not isinstance(text, str) or not text.strip():
+        return text
+    upper = text.upper()
+    anchors = [
+        'TABLA COMPLETA',
+        'LECTURAS VÁLIDAS',
+        'LECTURAS VALIDAS',
+        'MEDICIONES VÁLIDAS',
+        'MEDICIONES VALIDAS',
+        'HORA SIS DIA',
+        'FECHA HORA SIS DIA',
+    ]
+    positions = [upper.find(a) for a in anchors if upper.find(a) >= 0]
+    if positions:
+        return text[min(positions):]
+    return text
 
 # ─────────────────────────────────────────────────────────────────────────────
 # DATA PROCESSING
@@ -1241,6 +1269,13 @@ def main():
         noc_end   = st.number_input("Fin nocturno (hs)", 4, 10, 7, 1)
 
         st.markdown("---")
+        ignore_pdf_original = st.checkbox(
+            "Ignorar datos/resúmenes del PDF original",
+            value=True,
+            help="Usar el PDF sólo para extraer la tabla de lecturas crudas; los datos del paciente/estudio se toman del formulario y los promedios se recalculan."
+        )
+
+        st.markdown("---")
         st.markdown(f"<small>**{DOCTOR_NAME}**<br/>{DOCTOR_TITLE}<br/>{DOCTOR_MP}</small>",
                     unsafe_allow_html=True)
 
@@ -1278,12 +1313,13 @@ def main():
                                         _all_tables.extend(_tbls); break
                                 except: pass
                         _raw = "\n".join(_pages_text)
+                    _raw_lecturas = _isolate_lecturas_validas_text(_raw)
                     pdf_file.seek(0)  # reset for later use
 
-                    # Try to parse immediately
-                    _df_preview = _parse_from_text_v2(_raw)
+                    # Try to parse immediately. No usa estadísticas ni promedios del PDF.
+                    _df_preview = _parse_from_text_v2(_raw_lecturas)
                     if _df_preview is None:
-                        _df_preview = _parse_fixed_width(_raw)
+                        _df_preview = _parse_fixed_width(_raw_lecturas)
                     if _df_preview is None:
                         _df_preview = _parse_from_tables(_all_tables)
 
@@ -1467,8 +1503,10 @@ def main():
             'inicio': hora_inicio,
             'fin': hora_fin,
             'duracion': dur_str,
-            'dispositivo': meta.get('dispositivo', dispositivo),
-            'manguito': meta.get('manguito', manguito),
+            # Por defecto no se toman datos del encabezado/resumen del PDF original.
+            # El PDF se usa sólo como fuente de lecturas crudas; estos campos salen del formulario.
+            'dispositivo': dispositivo if ignore_pdf_original else meta.get('dispositivo', dispositivo),
+            'manguito': manguito if ignore_pdf_original else meta.get('manguito', manguito),
             'pct_validas': str(pct_val),
         }
 
