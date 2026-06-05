@@ -1,0 +1,10 @@
+streamlit
+pandas
+numpy
+pdfplumber
+matplotlib
+scipy
+reportlab
+PyMuPDF
+Pillow
+pytesseract
