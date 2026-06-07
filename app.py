@@ -12,7 +12,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import pdfplumber
-import io, base64, os, re, warnings
+import io, base64, os, re, warnings, hashlib
 from datetime import datetime
 import matplotlib
 matplotlib.use('Agg')
@@ -53,7 +53,7 @@ THRESHOLDS = {
     'nocturno': {'sys': 120, 'dia': 70},
 }
 
-OUTLIER = {'PAD_min': 35, 'PAD_max': 130, 'PAS_max': 230, 'PP_max': 80, 'PP_min': 10}
+OUTLIER = {'PAD_min': 40, 'PAD_max': 130, 'PAS_max': 230, 'PP_max': 80, 'PP_min': 20}
 
 DOCTOR_NAME     = "Ricardo Daniel Olano"
 DOCTOR_TITLE    = "Especialista Universitario en Cardiología"
@@ -182,6 +182,44 @@ def _standardize(df):
     return df if len(df) > 3 else None
 
 
+def _is_generated_report(text):
+    """
+    Detecta si el PDF cargado parece ser un informe ya generado por esta app
+    y no el PDF original del equipo MAPA.
+    """
+    if not text:
+        return False
+    t = text.lower()
+    señales_app = [
+        "monitoreo ambulatorio de presión arterial (m.a.p.a.)",
+        "ricardo daniel olano",
+        "conclusión ejecutiva",
+        "conclusión médica ampliada",
+        "comparación con guías",
+    ]
+    señales_equipo = [
+        "medicaldb",
+        "tabla completa",
+        "promedios horarios",
+        "representación gráfica de presiones",
+        "graficas de distribuciones",
+        "gráficas de distribuciones",
+    ]
+    score_app = sum(s in t for s in señales_app)
+    score_equipo = sum(s in t for s in señales_equipo)
+    return score_app >= 2 and score_equipo == 0
+
+
+@st.cache_data(show_spinner=False, ttl=3600, max_entries=8)
+def parse_mapa_pdf_cached(file_bytes, cache_version="v6.1-cache-ocr"):
+    """
+    Versión cacheada del parser pesado. Evita re-ejecutar OCR y parsers
+    en cada rerun de Streamlit. El cache se invalida automáticamente si
+    cambian los bytes del PDF o cache_version.
+    """
+    return parse_mapa_pdf(io.BytesIO(file_bytes))
+
+
 def parse_mapa_pdf(pdf_file):
     """
     Importación AUTOMÁTICA desde PDF original del equipo MAPA.
@@ -282,7 +320,7 @@ def parse_mapa_pdf(pdf_file):
     meta = _extract_meta(full_text)
 
     if df is None or len(df) < 10:
-        if _is_generated_report:
+        if _is_generated_report(full_text):
             pac = full_text.split("Paciente:")[1].split("\n")[0].strip() if "Paciente:" in full_text else "no identificado"
             msg = (
                 "⚠️ El PDF cargado es un INFORME YA GENERADO por esta app, no el PDF original del equipo MAPA. "
@@ -310,7 +348,7 @@ def parse_mapa_pdf(pdf_file):
     return df, meta, full_text
 
 
-def _ocr_pdf_pages(pdf_file, dpi=300):
+def _ocr_pdf_pages(pdf_file, dpi=200, first_pages=2, last_pages=3):
     """OCR de todas las páginas del PDF con PyMuPDF + Tesseract."""
     try:
         import fitz
@@ -329,7 +367,15 @@ def _ocr_pdf_pages(pdf_file, dpi=300):
     zoom = dpi / 72.0
     mat = fitz.Matrix(zoom, zoom)
 
-    for i, page in enumerate(doc):
+    n_pages = len(doc)
+    if first_pages is None and last_pages is None:
+        page_indices = list(range(n_pages))
+    else:
+        page_indices = sorted(set(list(range(min(first_pages or 0, n_pages))) +
+                                  list(range(max(0, n_pages - (last_pages or 0)), n_pages))))
+
+    for i in page_indices:
+        page = doc[i]
         pix = page.get_pixmap(matrix=mat, alpha=False)
         img = Image.open(io.BytesIO(pix.tobytes("png"))).convert("L")
         img = ImageOps.autocontrast(img, cutoff=2)
@@ -547,7 +593,7 @@ def _choose_plausible_row_from_cells(cells, reference_year=None):
     }
 
 
-def _ocr_medicaldb_table_layout(pdf_file, dpi=260):
+def _ocr_medicaldb_table_layout(pdf_file, dpi=220):
     """
     OCR por layout de la 'Tabla Completa' de MedicalDB.
     Usa detección de grilla para evitar leer promedios horarios o estadísticas.
@@ -2169,6 +2215,18 @@ def main():
         noc_start = st.number_input("Inicio nocturno (hs)", 20, 24, 23, 1)
         noc_end   = st.number_input("Fin nocturno (hs)", 4, 10, 7, 1)
         st.markdown("---")
+
+        if st.button("♻️ Reprocesar PDF / limpiar caché", use_container_width=True):
+            for k in [
+                "mapa_file_hash", "df_raw", "meta", "raw_text_debug",
+                "parse_error", "generated_pdf_bytes", "generated_csv_bytes",
+                "generated_base_name", "generated_audio_msg", "generated_summary"
+            ]:
+                st.session_state.pop(k, None)
+            parse_mapa_pdf_cached.clear()
+            st.rerun()
+
+        st.markdown("---")
         st.markdown(f"<small>**{DOCTOR_NAME}**<br/>{DOCTOR_TITLE}<br/>{DOCTOR_MP}</small>",
                     unsafe_allow_html=True)
 
@@ -2193,12 +2251,35 @@ def main():
         st.info("Subí el PDF original del MAPA. La app importará automáticamente datos filiatorios, datos del estudio y lecturas.")
         return
 
-    # Parse automático inmediato
-    with st.spinner("Importando automáticamente datos del PDF original..."):
-        result = parse_mapa_pdf(pdf_file)
+    file_bytes = pdf_file.getvalue()
+    file_hash = hashlib.sha256(file_bytes).hexdigest()
 
-    df_raw, meta_or_err, raw_text_debug = result
-    if df_raw is None:
+    # Parse automático, pero sólo si cambió el archivo. Evita reruns lentos.
+    if st.session_state.get("mapa_file_hash") != file_hash:
+        for k in [
+            "df_raw", "meta", "raw_text_debug", "parse_error",
+            "generated_pdf_bytes", "generated_csv_bytes",
+            "generated_base_name", "generated_audio_msg", "generated_summary"
+        ]:
+            st.session_state.pop(k, None)
+
+        with st.spinner("Importando automáticamente datos del PDF original. El primer procesamiento puede tardar por OCR..."):
+            df_raw, meta_or_err, raw_text_debug = parse_mapa_pdf_cached(file_bytes)
+
+        st.session_state["mapa_file_hash"] = file_hash
+        st.session_state["raw_text_debug"] = raw_text_debug
+
+        if df_raw is None:
+            st.session_state["parse_error"] = meta_or_err
+        else:
+            st.session_state["df_raw"] = df_raw
+            st.session_state["meta"] = meta_or_err if isinstance(meta_or_err, dict) else {}
+            st.session_state["parse_error"] = None
+
+    # Manejo de errores de importación
+    if st.session_state.get("parse_error"):
+        meta_or_err = st.session_state.get("parse_error")
+        raw_text_debug = st.session_state.get("raw_text_debug", "")
         is_gen = "⚠️ El PDF cargado es un INFORME YA GENERADO" in str(meta_or_err)
         if is_gen:
             st.warning(meta_or_err)
@@ -2219,196 +2300,220 @@ def main():
                 """)
         return
 
-    meta = meta_or_err if isinstance(meta_or_err, dict) else {}
+    df_raw = st.session_state.get("df_raw")
+    meta = st.session_state.get("meta", {})
+
+    if df_raw is None or len(df_raw) == 0:
+        st.error("No hay lecturas importadas.")
+        return
 
     st.success(f"✅ Importación automática completa: {len(df_raw)} lecturas crudas detectadas desde la Tabla Completa.")
 
     # Autocompletar datos filiatorios / estudio
-    nombre = meta.get("paciente", "NO ESPECIFICADO")
-    # Edad importada automáticamente desde fecha de nacimiento/fecha de estudio.
-    # Protección: algunos OCR devuelven año/documento como "edad" (ej. 1978, 2026).
+    nombre_default = meta.get("paciente", "NO ESPECIFICADO")
     try:
-        edad_val = int(meta.get("edad", 50))
+        edad_default = int(meta.get("edad", 50))
     except Exception:
-        edad_val = 50
-    if edad_val < 0 or edad_val > 120:
-        edad_val = 50
-    sexo = meta.get("sexo", "No especificado")
-    obra_social = meta.get("obra_social", "")
-    solicitante = meta.get("solicitante", "–")
-    motivo = meta.get("motivo", "–")
-    fecha_estudio = meta.get("fecha_inicio", datetime.now().strftime("%d/%m/%Y"))
-    hora_inicio = meta.get("hora_inicio", df_raw["hora"].iloc[0] if "hora" in df_raw.columns else "–")
-    hora_fin = meta.get("hora_fin", df_raw["hora"].iloc[-1] if "hora" in df_raw.columns else "–")
-    dispositivo = meta.get("dispositivo", "No especificado")
-    manguito = meta.get("manguito", "No especificado")
-    dur_str = meta.get("duracion_str", "No especificado")
+        edad_default = 50
+    if edad_default < 0 or edad_default > 120:
+        edad_default = 50
+
+    sexo_default = meta.get("sexo", "No especificado")
+    obra_social_default = meta.get("obra_social", "")
+    solicitante_default = meta.get("solicitante", "–")
+    motivo_default = meta.get("motivo", "–")
+    fecha_default = meta.get("fecha_inicio", datetime.now().strftime("%d/%m/%Y"))
+    hora_inicio_default = meta.get("hora_inicio", df_raw["hora"].iloc[0] if "hora" in df_raw.columns else "–")
+    hora_fin_default = meta.get("hora_fin", df_raw["hora"].iloc[-1] if "hora" in df_raw.columns else "–")
+    dispositivo_default = meta.get("dispositivo", "No especificado")
+    manguito_default = meta.get("manguito", "No especificado")
+    dur_str_default = meta.get("duracion_str", meta.get("duracion", "No especificado"))
 
     st.subheader("2. Datos importados automáticamente")
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Paciente", nombre[:28])
-    c2.metric("Edad / sexo", f"{edad_val} / {sexo}")
-    c3.metric("Obra social", obra_social[:24])
-    c4.metric("Fecha", fecha_estudio)
+    c1.metric("Paciente", nombre_default[:28])
+    c2.metric("Edad / sexo", f"{edad_default} / {sexo_default}")
+    c3.metric("Obra social", obra_social_default[:24])
+    c4.metric("Fecha", fecha_default)
 
     c5, c6, c7, c8 = st.columns(4)
-    c5.metric("Inicio", hora_inicio)
-    c6.metric("Fin", hora_fin)
-    c7.metric("Duración", dur_str)
-    c8.metric("Dispositivo", dispositivo[:24])
+    c5.metric("Inicio", hora_inicio_default)
+    c6.metric("Fin", hora_fin_default)
+    c7.metric("Duración", dur_str_default)
+    c8.metric("Dispositivo", dispositivo_default[:24])
 
     with st.expander("Vista previa de lecturas importadas", expanded=False):
         st.dataframe(df_raw, use_container_width=True)
 
-    # Permitir corrección de filiatorios; se expande automáticamente si faltan datos clave.
-    _faltan_datos = (sexo == "No especificado" or not obra_social.strip())
+    _faltan_datos = (sexo_default == "No especificado" or not str(obra_social_default).strip())
     if _faltan_datos:
         st.warning("⚠️ Sexo y/u obra social no figuran en el PDF — completar manualmente antes de generar.")
-    with st.expander("Completar / corregir datos del paciente", expanded=_faltan_datos):
-        st.caption("Corrija cualquier campo que el OCR haya leído con error o que esté en blanco en el PDF del dispositivo.")
-        nombre = st.text_input("Nombre y apellido", value=nombre)
+
+    st.markdown("---")
+    st.subheader("3. Completar/corregir y generar")
+
+    # Formulario: evita reruns en cada edición de campo.
+    with st.form("form_generar_mapa", clear_on_submit=False):
+        st.caption("Los cambios en estos campos no reprocesan el PDF hasta presionar el botón de generación.")
+        nombre = st.text_input("Nombre y apellido", value=nombre_default)
         cc1, cc2, cc3 = st.columns(3)
-        try:
-            edad_input_val = int(edad_val)
-        except Exception:
-            edad_input_val = 50
-        edad_input_val = max(0, min(120, edad_input_val))
-        edad_val = cc1.number_input("Edad", min_value=0, max_value=120, value=edad_input_val, step=1)
-        sexo = cc2.selectbox("Sexo", ["Masculino", "Femenino", "No especificado"],
-                             index=(0 if sexo == "Masculino" else 1 if sexo == "Femenino" else 2))
-        obra_social = cc3.text_input("Obra social", value=obra_social)
-        solicitante = st.text_input("Solicitante", value=solicitante)
-        motivo = st.text_input("Motivo", value=motivo)
-        fecha_estudio = st.text_input("Fecha estudio", value=fecha_estudio)
-        hora_inicio = st.text_input("Hora inicio", value=hora_inicio)
-        hora_fin = st.text_input("Hora fin", value=hora_fin)
-        dispositivo = st.text_input("Dispositivo", value=dispositivo)
-        manguito = st.text_input("Manguito", value=manguito)
+        edad_val = cc1.number_input("Edad", min_value=0, max_value=120, value=int(edad_default), step=1)
+        sexo = cc2.selectbox(
+            "Sexo",
+            ["Masculino", "Femenino", "No especificado"],
+            index=(0 if sexo_default == "Masculino" else 1 if sexo_default == "Femenino" else 2)
+        )
+        obra_social = cc3.text_input("Obra social", value=obra_social_default)
+        solicitante = st.text_input("Solicitante", value=solicitante_default)
+        motivo = st.text_input("Motivo", value=motivo_default)
+        f1, f2, f3 = st.columns(3)
+        fecha_estudio = f1.text_input("Fecha estudio", value=fecha_default)
+        hora_inicio = f2.text_input("Hora inicio", value=hora_inicio_default)
+        hora_fin = f3.text_input("Hora fin", value=hora_fin_default)
+        d1, d2 = st.columns(2)
+        dispositivo = d1.text_input("Dispositivo", value=dispositivo_default)
+        manguito = d2.text_input("Manguito", value=manguito_default)
 
-    st.markdown("---")
-    generate = st.button("⚕️ Calcular todo y generar informe PDF", use_container_width=True)
+        generate = st.form_submit_button("⚕️ Calcular todo y generar informe PDF", use_container_width=True)
 
-    if not generate:
-        return
+    if generate:
+        with st.spinner("Depurando lecturas, recalculando métricas y generando informe..."):
+            df_work = df_raw.copy()
 
-    with st.spinner("Depurando lecturas, recalculando métricas y generando informe..."):
-        # Si el parser trae períodos desde la tabla, se respetan; si faltan, se asignan por horario.
-        if "Período" not in df_raw.columns or df_raw["Período"].isna().all():
-            df_raw = assign_periods(df_raw, noc_start=int(noc_start), noc_end=int(noc_end))
-        else:
-            # Completar blancos por horario.
-            tmp = assign_periods(df_raw.drop(columns=["Período"], errors="ignore"),
-                                 noc_start=int(noc_start), noc_end=int(noc_end))
-            df_raw["Período"] = df_raw["Período"].fillna(tmp["Período"])
-            df_raw["Período"] = df_raw["Período"].replace("", np.nan).fillna(tmp["Período"])
-            df_raw["periodo_asumido"] = False
+            # Si el parser trae períodos desde la tabla, se respetan; si faltan, se asignan por horario.
+            if "Período" not in df_work.columns or df_work["Período"].isna().all():
+                df_work = assign_periods(df_work, noc_start=int(noc_start), noc_end=int(noc_end))
+            else:
+                tmp = assign_periods(df_work.drop(columns=["Período"], errors="ignore"),
+                                     noc_start=int(noc_start), noc_end=int(noc_end))
+                df_work["Período"] = df_work["Período"].fillna(tmp["Período"])
+                df_work["Período"] = df_work["Período"].replace("", np.nan).fillna(tmp["Período"])
+                df_work["periodo_asumido"] = False
 
-        df_clean, excluded, n_orig = clean_data(df_raw)
+            df_clean, excluded, n_orig = clean_data(df_work)
 
-        if len(df_clean) < 20:
-            st.error(f"Quedan sólo {len(df_clean)} lecturas válidas tras depuración. Revisar OCR/tabla. No se genera informe con una tabla incompleta.")
-            return
+            if len(df_clean) < 20:
+                st.error(f"Quedan sólo {len(df_clean)} lecturas válidas tras depuración. Revisar OCR/tabla. No se genera informe con una tabla incompleta.")
+                return
 
-        # Calidad del estudio: si el PDF informa porcentaje, se conserva; si no, se recalcula.
-        if meta.get("pct_validas_pdf"):
-            pct_val = meta.get("pct_validas_pdf")
-        else:
-            pct_val = round(len(df_clean) / n_orig * 100, 1) if n_orig else "–"
+            if meta.get("pct_validas_pdf"):
+                pct_val = meta.get("pct_validas_pdf")
+            else:
+                pct_val = round(len(df_clean) / n_orig * 100, 1) if n_orig else "–"
 
-        is_ped = int(edad_val) < 17
-        sex_code = "F" if "Fem" in sexo else "M"
-        m = calculate_metrics(df_clean, age=edad_val if is_ped else None,
-                              is_ped=is_ped, sex=sex_code, height=None)
-        phenotype = classify_phenotype(m)
+            is_ped = int(edad_val) < 17
+            sex_code = "F" if "Fem" in sexo else "M"
+            m = calculate_metrics(df_clean, age=edad_val if is_ped else None,
+                                  is_ped=is_ped, sex=sex_code, height=None)
+            phenotype = classify_phenotype(m)
 
-        pat_info = {
-            "nombre": nombre,
-            "edad": str(int(edad_val)),
-            "sexo": sexo,
-            "obra_social": obra_social,
-            "solicitante": solicitante or "–",
-            "motivo": motivo or "–",
-            "is_pediatric": is_ped,
-            "duracion_str": dur_str,
-        }
-        stu_info = {
-            "fecha": fecha_estudio,
-            "inicio": hora_inicio,
-            "fin": hora_fin,
-            "duracion": dur_str,
-            "dispositivo": dispositivo,
-            "manguito": manguito,
-            "pct_validas": str(pct_val),
-        }
+            pat_info = {
+                "nombre": nombre,
+                "edad": str(int(edad_val)),
+                "sexo": sexo,
+                "obra_social": obra_social,
+                "solicitante": solicitante or "–",
+                "motivo": motivo or "–",
+                "is_pediatric": is_ped,
+                "duracion_str": dur_str_default,
+            }
+            stu_info = {
+                "fecha": fecha_estudio,
+                "inicio": hora_inicio,
+                "fin": hora_fin,
+                "duracion": dur_str_default,
+                "dispositivo": dispositivo,
+                "manguito": manguito,
+                "pct_validas": str(pct_val),
+            }
 
-        # Assets: usar upload o archivos locales si están disponibles.
-        logo_bytes = img_to_bytes(logo_file) if logo_file else img_to_bytes("/mnt/data/logo IPENSA.png")
-        firma_bytes = img_to_bytes(firma_file) if firma_file else img_to_bytes("/mnt/data/FIRMA PNG.png")
+            logo_bytes = img_to_bytes(logo_file) if logo_file else img_to_bytes("/mnt/data/logo IPENSA.png")
+            firma_bytes = img_to_bytes(firma_file) if firma_file else img_to_bytes("/mnt/data/FIRMA PNG.png")
 
-        pdf_buf = generate_pdf(df_clean, m, pat_info, stu_info, phenotype,
-                               logo_bytes, firma_bytes, excluded)
+            pdf_buf = generate_pdf(df_clean, m, pat_info, stu_info, phenotype,
+                                   logo_bytes, firma_bytes, excluded)
 
-    st.markdown("---")
-    st.subheader("📊 Resumen recalculado desde lecturas del PDF")
+            nombre_clean = re.sub(r"[^A-Za-z0-9]", "_", (nombre or "Paciente").upper())
+            fecha_clean = str(fecha_estudio).replace("/", "-")
+            os_clean = re.sub(r"[^A-Za-z0-9]", "_", (obra_social or "SinOS").upper())
+            base_name = f"{nombre_clean}_{fecha_clean}_MAPA_{os_clean}"
 
-    col_a, col_b, col_c, col_d = st.columns(4)
-    col_a.metric("Fenotipo", phenotype if len(phenotype) < 25 else phenotype[:24] + "...")
-    col_b.metric("Patrón circadiano", m.get("dip_pattern", "-"))
-    col_c.metric("AASI", (safe(m.get("aasi"), "2") + " - " + str(m.get("aasi_interp", "-")))[:25])
-    col_d.metric("PP 24h", f"{safe(m.get('PP_24h'), '1')} mmHg")
+            csv_io = io.StringIO()
+            df_clean.to_csv(csv_io, index=False, encoding="utf-8-sig")
 
-    col_e, col_f, col_g, col_h = st.columns(4)
-    col_e.metric("PAS/PAD 24h", f"{safe(m.get('PAS_24h'), '1')}/{safe(m.get('PAD_24h'), '1')} mmHg")
-    col_f.metric("PAS/PAD Diurno", f"{safe(m.get('PAS_diurno'), '1')}/{safe(m.get('PAD_diurno'), '1')} mmHg")
-    col_g.metric("PAS/PAD Nocturno", f"{safe(m.get('PAS_nocturno'), '1')}/{safe(m.get('PAD_nocturno'), '1')} mmHg")
-    col_h.metric("Lecturas usadas", f"{len(df_clean)} / {n_orig}")
+            audio_msg = f"ESTUDIO MAPA INFORMADO DE {(nombre or 'PACIENTE').upper()}, {fecha_estudio}, {(obra_social or 'SIN OBRA SOCIAL').upper()}"
 
-    if excluded > 0:
-        st.info(f"{excluded} medición(es) fueron excluidas durante la depuración de datos.")
+            st.session_state["generated_pdf_bytes"] = pdf_buf.getvalue()
+            st.session_state["generated_csv_bytes"] = csv_io.getvalue().encode("utf-8-sig")
+            st.session_state["generated_base_name"] = base_name
+            st.session_state["generated_audio_msg"] = audio_msg
+            st.session_state["generated_summary"] = {
+                "phenotype": phenotype,
+                "dip_pattern": m.get("dip_pattern", "-"),
+                "aasi": safe(m.get("aasi"), "2") + " - " + str(m.get("aasi_interp", "-")),
+                "pp24": f"{safe(m.get('PP_24h'), '1')} mmHg",
+                "pas24": f"{safe(m.get('PAS_24h'), '1')}/{safe(m.get('PAD_24h'), '1')} mmHg",
+                "pas_day": f"{safe(m.get('PAS_diurno'), '1')}/{safe(m.get('PAD_diurno'), '1')} mmHg",
+                "pas_night": f"{safe(m.get('PAS_nocturno'), '1')}/{safe(m.get('PAD_nocturno'), '1')} mmHg",
+                "used": f"{len(df_clean)} / {n_orig}",
+                "excluded": excluded,
+            }
 
-    nombre_clean = re.sub(r"[^A-Za-z0-9]", "_", (nombre or "Paciente").upper())
-    fecha_clean = str(fecha_estudio).replace("/", "-")
-    os_clean = re.sub(r"[^A-Za-z0-9]", "_", (obra_social or "SinOS").upper())
-    base_name = f"{nombre_clean}_{fecha_clean}_MAPA_{os_clean}"
+    # Mostrar resultado persistente tras generar.
+    if st.session_state.get("generated_pdf_bytes"):
+        summary = st.session_state.get("generated_summary", {})
+        st.markdown("---")
+        st.subheader("📊 Resumen recalculado desde lecturas del PDF")
 
-    pdf_bytes = pdf_buf.getvalue()
-    st.download_button(
-        label="Descargar informe PDF",
-        data=pdf_bytes,
-        file_name=f"{base_name}.pdf",
-        mime="application/pdf",
-        use_container_width=True
-    )
+        col_a, col_b, col_c, col_d = st.columns(4)
+        col_a.metric("Fenotipo", summary.get("phenotype", "-")[:25])
+        col_b.metric("Patrón circadiano", summary.get("dip_pattern", "-"))
+        col_c.metric("AASI", summary.get("aasi", "-")[:25])
+        col_d.metric("PP 24h", summary.get("pp24", "-"))
 
-    # CSV para auditoría
-    csv_io = io.StringIO()
-    df_clean.to_csv(csv_io, index=False, encoding="utf-8-sig")
-    st.download_button(
-        label="Descargar lecturas depuradas CSV",
-        data=csv_io.getvalue().encode("utf-8-sig"),
-        file_name=f"{base_name}_lecturas_depuradas.csv",
-        mime="text/csv",
-        use_container_width=True
-    )
+        col_e, col_f, col_g, col_h = st.columns(4)
+        col_e.metric("PAS/PAD 24h", summary.get("pas24", "-"))
+        col_f.metric("PAS/PAD Diurno", summary.get("pas_day", "-"))
+        col_g.metric("PAS/PAD Nocturno", summary.get("pas_night", "-"))
+        col_h.metric("Lecturas usadas", summary.get("used", "-"))
 
-    audio_msg = f"ESTUDIO MAPA INFORMADO DE {(nombre or 'PACIENTE').upper()}, {fecha_estudio}, {(obra_social or 'SIN OBRA SOCIAL').upper()}"
-    st.markdown(f"""
-    <div style="margin-top:1rem;padding:0.8rem 1rem;background:#e8f0fe;border-radius:8px;
-                border-left:4px solid #1F3864;font-family:Arial;font-size:1rem;font-weight:bold;">
-        {audio_msg}
-    </div>
-    <script>
-    setTimeout(function(){{
-        if('speechSynthesis' in window){{
-            var msg=new SpeechSynthesisUtterance("{audio_msg}");
-            msg.lang='es-AR'; msg.rate=0.9; msg.volume=1;
-            window.speechSynthesis.speak(msg);
-        }}
-    }},1200);
-    </script>
-    """, unsafe_allow_html=True)
-    st.success(f"Informe generado: {base_name}.pdf")
-    st.caption(audio_msg)
+        if summary.get("excluded", 0) > 0:
+            st.info(f"{summary.get('excluded')} medición(es) fueron excluidas durante la depuración de datos.")
+
+        base_name = st.session_state["generated_base_name"]
+        st.download_button(
+            label="Descargar informe PDF",
+            data=st.session_state["generated_pdf_bytes"],
+            file_name=f"{base_name}.pdf",
+            mime="application/pdf",
+            use_container_width=True
+        )
+        st.download_button(
+            label="Descargar lecturas depuradas CSV",
+            data=st.session_state["generated_csv_bytes"],
+            file_name=f"{base_name}_lecturas_depuradas.csv",
+            mime="text/csv",
+            use_container_width=True
+        )
+
+        audio_msg = st.session_state["generated_audio_msg"]
+        st.markdown(f"""
+        <div style="margin-top:1rem;padding:0.8rem 1rem;background:#e8f0fe;border-radius:8px;
+                    border-left:4px solid #1F3864;font-family:Arial;font-size:1rem;font-weight:bold;">
+            {audio_msg}
+        </div>
+        <script>
+        setTimeout(function(){{
+            if('speechSynthesis' in window){{
+                var msg=new SpeechSynthesisUtterance("{audio_msg}");
+                msg.lang='es-AR'; msg.rate=0.9; msg.volume=1;
+                window.speechSynthesis.speak(msg);
+            }}
+        }},1200);
+        </script>
+        """, unsafe_allow_html=True)
+        st.success(f"Informe generado: {base_name}.pdf")
+        st.caption(audio_msg)
 
 if __name__ == '__main__':
     main()
