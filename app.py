@@ -211,7 +211,7 @@ def _is_generated_report(text):
 
 
 @st.cache_data(show_spinner=False, ttl=3600, max_entries=8)
-def parse_mapa_pdf_cached(file_bytes, cache_version="v6.1-cache-ocr"):
+def parse_mapa_pdf_cached(file_bytes, cache_version="v6.4-fast-grid-meta-timeout"):
     """
     Versión cacheada del parser pesado. Evita re-ejecutar OCR y parsers
     en cada rerun de Streamlit. El cache se invalida automáticamente si
@@ -220,18 +220,22 @@ def parse_mapa_pdf_cached(file_bytes, cache_version="v6.1-cache-ocr"):
     return parse_mapa_pdf(io.BytesIO(file_bytes))
 
 
+
+
 def parse_mapa_pdf(pdf_file):
     """
     Importación AUTOMÁTICA desde PDF original del equipo MAPA.
     Lee datos filiatorios, datos del estudio y TODA la tabla completa.
-    Nunca usa los promedios/resúmenes del PDF para calcular: solo lecturas crudas.
+    Optimización v6.3: primero intenta grilla OCR de la Tabla Completa y
+    solo ejecuta OCR completo si la grilla no alcanza lecturas suficientes.
     """
     raw_text = ""
     ocr_text = ""
+    meta_ocr_text = ""
     all_tables = []
     diagnostics = []
 
-    # 1) Texto/tablas digitales, si existen
+    # 1) Texto/tablas digitales, si existen.
     try:
         pdf_file.seek(0)
         with pdfplumber.open(pdf_file) as pdf:
@@ -257,67 +261,92 @@ def parse_mapa_pdf(pdf_file):
     except Exception as e:
         diagnostics.append(f"pdfplumber no pudo leer texto/tablas: {e}")
 
-    # 2) OCR automático. Se ejecuta siempre que el texto digital sea insuficiente
-    # o cuando no aparezca Tabla Completa.
-    need_ocr = (len(raw_text) < 1500) or ("tabla completa" not in raw_text.lower())
-    if need_ocr:
-        try:
-            pdf_file.seek(0)
-            ocr_text = _ocr_pdf_pages(pdf_file)
-            diagnostics.append(f"OCR: {len(ocr_text)} caracteres")
-        except Exception as e:
-            diagnostics.append(f"OCR no disponible o falló: {e}")
-            ocr_text = ""
+    # 2) OCR liviano de primeras páginas para paciente, obra social, inicio/fin.
+    try:
+        pdf_file.seek(0)
+        meta_ocr_text = _ocr_metadata_pages(pdf_file, dpi=190, max_pages=2)
+        diagnostics.append(f"OCR metadatos: {len(meta_ocr_text)} caracteres")
+    except Exception as e:
+        diagnostics.append(f"OCR metadatos no disponible o falló: {e}")
+        meta_ocr_text = ""
 
-    full_text = "\n".join([raw_text, ocr_text]).strip()
+    full_text_pre = "\n".join([raw_text, meta_ocr_text]).strip()
+    meta = _extract_meta(full_text_pre)
 
-    # 3) Prioridad máxima: Tabla Completa del MedicalDB, no promedios horarios ni informe generado.
-    # Primero intentar OCR por layout/celdas; luego OCR lineal.
+    # 3) Tabla completa por grilla OCR, antes de OCR completo.
     df = None
     try:
         pdf_file.seek(0)
-        df_layout = _ocr_medicaldb_table_layout(pdf_file)
+        df_layout = _ocr_medicaldb_table_layout(pdf_file, dpi=170, last_pages=2)
         if df_layout is not None:
             df = df_layout
-            diagnostics.append(f"OCR por celdas: {len(df_layout)} lecturas")
+            diagnostics.append(f"OCR por grilla/celdas: {len(df_layout)} lecturas")
     except Exception as e:
-        diagnostics.append(f"OCR por celdas no disponible o falló: {e}")
+        diagnostics.append(f"OCR por grilla/celdas no disponible o falló: {e}")
 
-    if df is None or len(df) < 20:
-        df = _parse_medicaldb_table_text(full_text)
+    # Estimar mínimo aceptable según estadísticas si se pudo leer.
+    min_expected = 25
+    m_total = re.search(r"Total\s+de\s+Mediciones\s+v[áa]lidas[:\s]+(\d{2,3})", full_text_pre, re.I)
+    if m_total:
+        try:
+            min_expected = max(20, int(int(m_total.group(1)) * 0.70))
+        except Exception:
+            pass
 
-    # 3.5) Parser ZLogic/MedicalDB 17.7 – formato celdas | y [ con OCR ruidoso
-    if df is None or len(df) < 20:
+    # 4) OCR completo únicamente si la grilla no fue suficiente.
+    need_full_ocr = (df is None or len(df) < min_expected)
+    if need_full_ocr:
+        try:
+            pdf_file.seek(0)
+            ocr_text = _ocr_pdf_pages(pdf_file, dpi=150, first_pages=0, last_pages=2)
+            diagnostics.append(f"OCR completo acotado: {len(ocr_text)} caracteres")
+        except Exception as e:
+            diagnostics.append(f"OCR completo no disponible o falló: {e}")
+            ocr_text = ""
+
+    full_text = "\n".join([raw_text, meta_ocr_text, ocr_text]).strip()
+    meta2 = _extract_meta(full_text)
+    # Fusionar metadatos: lo nuevo no pisa datos válidos previos salvo que falten.
+    for k, v in meta2.items():
+        if v and (k not in meta or not meta.get(k)):
+            meta[k] = v
+
+    # 5) Parsers de texto como respaldo.
+    if df is None or len(df) < min_expected:
+        df_text = _parse_medicaldb_table_text(full_text)
+        if df_text is not None and len(df_text) > (len(df) if df is not None else 0):
+            df = df_text
+            diagnostics.append(f"Parser MedicalDB texto: {len(df_text)} lecturas")
+
+    if df is None or len(df) < min_expected:
         df_zl = _parse_zlogic_table(full_text)
         if df_zl is not None and len(df_zl) > (len(df) if df is not None else 0):
             df = df_zl
-            diagnostics.append(f"ZLogic parser: {len(df_zl)} lecturas")
+            diagnostics.append(f"Parser ZLogic: {len(df_zl)} lecturas")
 
-    # 4) Segunda opción: tablas digitales del PDF original
-    if df is None or len(df) < 20:
+    if df is None or len(df) < min_expected:
         df_tbl = _parse_from_tables(all_tables)
         if df_tbl is not None and len(df_tbl) > (len(df) if df is not None else 0):
             df = df_tbl
+            diagnostics.append(f"Tablas digitales: {len(df_tbl)} lecturas")
 
-    # 5) Parser agresivo de texto
     if (df is None or len(df) < 20) and ("resultados – promedios" not in full_text.lower()):
         df2 = _parse_from_text_v2(full_text)
         if df2 is not None and len(df2) > (len(df) if df is not None else 0):
             df = df2
+            diagnostics.append(f"Parser texto v2: {len(df2)} lecturas")
 
-    # 6) _parse_fixed_width – columnas de ancho fijo (faltaba en el pipeline)
     if df is None or len(df) < 20:
         df_fw = _parse_fixed_width(full_text)
         if df_fw is not None and len(df_fw) > (len(df) if df is not None else 0):
             df = df_fw
+            diagnostics.append(f"Parser ancho fijo: {len(df_fw)} lecturas")
 
-    # 7) Último recurso: extracción numérica pura, tolera OCR muy ruidoso
     if df is None or len(df) < 10:
         df_np = _parse_numeric_pairs(full_text)
         if df_np is not None and len(df_np) > (len(df) if df is not None else 0):
             df = df_np
-
-    meta = _extract_meta(full_text)
+            diagnostics.append(f"Parser numérico: {len(df_np)} lecturas")
 
     if df is None or len(df) < 10:
         if _is_generated_report(full_text):
@@ -332,21 +361,37 @@ def parse_mapa_pdf(pdf_file):
             msg = (
                 "No se pudo importar una TABLA COMPLETA válida desde el PDF original. "
                 "El archivo no contiene lecturas crudas suficientes. "
-                "Verifique en Diagnóstico técnico que el OCR contiene filas con hora y valores numéricos. "
-                + " | ".join(diagnostics)
+                "Diagnóstico técnico: " + " | ".join(diagnostics)
             )
         return None, msg, full_text
 
-    # Ordenar por número de fila si existe; si no, preservar orden de lectura.
+    # 6) Limpieza de duplicados manteniendo orden de fila.
     if 'nro' in df.columns:
-        df = df.sort_values('nro').drop_duplicates('nro', keep='first')
+        df['nro'] = pd.to_numeric(df['nro'], errors='coerce')
+        if df['nro'].notna().sum() >= max(5, len(df)//2):
+            df = df.sort_values('nro', na_position='last').drop_duplicates('nro', keep='first')
+    subset = [c for c in ['fecha', 'hora', 'PAS', 'PAD'] if c in df.columns]
+    if subset:
+        df = df.drop_duplicates(subset=subset, keep='first')
     df = df.reset_index(drop=True)
 
-    # Fecha/hora combinada para gráficos cronológicos
+    # 7) Eje temporal y períodos.
     df = _ensure_datetime_sequence(df, meta)
+    df = assign_periods(df)
+
+    # 8) Completar metadatos desde tabla si faltan.
+    if "fecha_inicio" not in meta and "dt" in df.columns and df["dt"].notna().any():
+        meta["fecha_inicio"] = df["dt"].dropna().iloc[0].strftime("%d/%m/%Y")
+    if "hora_inicio" not in meta and "hora" in df.columns and len(df):
+        meta["hora_inicio"] = str(df["hora"].iloc[0])[:5]
+    if "fecha_fin" not in meta and "dt" in df.columns and df["dt"].notna().any():
+        meta["fecha_fin"] = df["dt"].dropna().iloc[-1].strftime("%d/%m/%Y")
+    if "hora_fin" not in meta and "hora" in df.columns and len(df):
+        meta["hora_fin"] = str(df["hora"].iloc[-1])[:5]
+
+    meta["_diagnostico_importacion"] = " | ".join(diagnostics)
 
     return df, meta, full_text
-
 
 def _ocr_pdf_pages(pdf_file, dpi=200, first_pages=2, last_pages=3):
     """OCR de todas las páginas del PDF con PyMuPDF + Tesseract."""
@@ -389,9 +434,9 @@ def _ocr_pdf_pages(pdf_file, dpi=200, first_pages=2, last_pages=3):
             config = f"--oem 3 --psm {psm}"
             try:
                 try:
-                    txt = pytesseract.image_to_string(img, lang="spa+eng", config=config)
+                    txt = pytesseract.image_to_string(img, lang="spa+eng", config=config, timeout=8)
                 except Exception:
-                    txt = pytesseract.image_to_string(img, lang="eng", config=config)
+                    txt = pytesseract.image_to_string(img, lang="eng", config=config, timeout=8)
                 score = len(re.findall(r'\d', txt))
                 if score > best_score:
                     best_score = score
@@ -400,6 +445,52 @@ def _ocr_pdf_pages(pdf_file, dpi=200, first_pages=2, last_pages=3):
                 pass
         texts.append(f"\n--- OCR_PAGE_{i+1} ---\n{best_txt}")
 
+    return "\n".join(texts)
+
+
+
+def _ocr_metadata_pages(pdf_file, dpi=260, max_pages=3):
+    """
+    OCR liviano de las primeras páginas para filiatorios/datos del estudio.
+    Se usa aunque la tabla ya haya sido detectada, porque las carátulas de
+    MedicalDB suelen ser imágenes y pdfplumber no extrae Obra Social/Sexo.
+    """
+    try:
+        import fitz
+        import pytesseract
+        from PIL import Image, ImageOps, ImageEnhance
+    except Exception as e:
+        raise RuntimeError(f"OCR de metadatos no disponible: {e}")
+
+    pdf_file.seek(0)
+    data = pdf_file.read()
+    doc = fitz.open(stream=data, filetype="pdf")
+    texts = []
+    mat = fitz.Matrix(dpi/72.0, dpi/72.0)
+
+    for i in range(min(max_pages, len(doc))):
+        pix = doc[i].get_pixmap(matrix=mat, alpha=False)
+        img = Image.open(io.BytesIO(pix.tobytes("png"))).convert("L")
+        img = ImageOps.autocontrast(img, cutoff=1)
+        img = ImageEnhance.Sharpness(img).enhance(1.6)
+        img = ImageEnhance.Contrast(img).enhance(1.4)
+        best_txt = ""
+        best_score = -1
+        for psm in (6, 4, 11):
+            try:
+                txt = pytesseract.image_to_string(img, lang="spa+eng", config=f"--oem 3 --psm {psm}", timeout=6)
+            except Exception:
+                txt = pytesseract.image_to_string(img, lang="eng", config=f"--oem 3 --psm {psm}", timeout=6)
+            # Puntuar por presencia de etiquetas útiles, no solo por dígitos.
+            low = txt.lower()
+            score = len(re.findall(r"\d", txt))
+            for term in ["obra", "social", "sexo", "nacimiento", "inicio", "fin", "documento", "paciente"]:
+                if term in low:
+                    score += 80
+            if score > best_score:
+                best_score = score
+                best_txt = txt
+        texts.append(f"\n--- OCR_META_PAGE_{i+1} ---\n{best_txt}")
     return "\n".join(texts)
 
 
@@ -523,81 +614,225 @@ def _merge_positions(vals, tol=10):
     return out
 
 
+
 def _numeric_candidates_from_cell(txt, low, high):
-    """Devuelve candidatos numéricos desde una celda OCR con flechas/ruido."""
+    """
+    Devuelve candidatos numéricos desde una celda OCR con ruido.
+    Versión robusta para MedicalDB 17.7:
+    - contempla confusiones habituales: o→0, i/l/I→1, s→5, a→4, g/q→9,
+      B→8, G→6, y f/F como 1 o 6.
+    - genera variantes acotadas para no explotar combinatoriamente.
+    - toma números completos y substrings 2-3 dígitos.
+    """
+    if txt is None:
+        return []
+    raw = str(txt).strip()
+    if not raw:
+        return []
+
+    # Si ya hay dígitos claros, se preservan.
+    base = raw.replace("↑", "").replace("↓", "")
+    trans_single = {
+        "o": ["0"], "O": ["0"], "Q": ["0"],
+        "l": ["1"], "I": ["1"], "i": ["1"], "!": ["1"],
+        "s": ["5"], "S": ["5"],
+        "B": ["8"], "b": ["6"],
+        "G": ["6"],
+        "a": ["4"], "A": ["4"],
+        "q": ["9"], "g": ["9"],
+        "t": ["1"], "T": ["1"],
+        # f puede ser 1 (115 leído fis) o 6 (64 leído fea).
+        "f": ["1", "6"], "F": ["1", "6"],
+        "e": [""], "E": [""],
+        "|": [""], "[": [""], "]": [""], "{": [""], "}": [""],
+        "_": [""], "(": [""], ")": [""], ":": [""], ";": [""],
+        ".": [""], ",": [""], "-": [""], " ": [""],
+    }
+
+    variants = [""]
+    for ch in base:
+        if ch.isdigit():
+            opts = [ch]
+        elif ch in trans_single:
+            opts = trans_single[ch]
+        else:
+            opts = [""]
+        nv = []
+        for v in variants:
+            for o in opts:
+                nv.append(v + o)
+                if len(nv) >= 300:
+                    break
+            if len(nv) >= 300:
+                break
+        variants = nv or variants
+
     cands = set()
-    s = _num_clean_token(txt)
-    for seq in re.findall(r"\d+", s):
-        vals = set()
-        if 1 <= len(seq) <= 3:
-            vals.add(int(seq))
-        # substrings 2-3 dígitos y eliminación de un dígito para casos tipo 1545 -> 155/154/145
-        for L in (2, 3):
-            for i in range(0, max(0, len(seq)-L+1)):
-                vals.add(int(seq[i:i+L]))
-        if len(seq) >= 4:
-            for i in range(len(seq)):
-                ss = seq[:i] + seq[i+1:]
-                for L in (2, 3):
-                    for j in range(0, max(0, len(ss)-L+1)):
-                        vals.add(int(ss[j:j+L]))
-        for v in vals:
-            if low <= v <= high:
-                cands.add(v)
+    # También probar limpieza clásica.
+    variants.append(_num_clean_token(base))
+    for v in variants:
+        digits = re.sub(r"\D", "", v)
+        if not digits:
+            continue
+        seqs = set()
+        seqs.add(digits)
+        for L in (1, 2, 3):
+            if len(digits) >= L:
+                for i in range(0, len(digits)-L+1):
+                    seqs.add(digits[i:i+L])
+        # Si hay 4+ dígitos unidos, probar eliminando un dígito.
+        if len(digits) >= 4:
+            for k in range(len(digits)):
+                dd = digits[:k] + digits[k+1:]
+                if dd:
+                    seqs.add(dd[-3:] if len(dd) > 3 else dd)
+        for s in seqs:
+            if not s:
+                continue
+            try:
+                val = int(s)
+                if low <= val <= high:
+                    cands.add(val)
+            except Exception:
+                pass
+
     return sorted(cands)
 
 
 def _choose_plausible_row_from_cells(cells, reference_year=None):
-    """Interpreta una fila de Tabla Completa leída por layout OCR."""
+    """
+    Interpreta una fila de Tabla Completa leída por OCR/layout.
+    A diferencia de la versión original, no exige que todas las celdas estén
+    perfectas: si PAD o PP salen ilegibles, los infiere desde PAS, PAM y PP.
+    Esto evita perder filas cuando Tesseract lee 71 como '|__|' o 64 como 'fea'.
+    """
     if len(cells) < 7:
         return None
-    fecha = _normalize_date_token(cells[1], reference_year=reference_year)
-    hora = _normalize_time_token(cells[2])
-    if not fecha or not hora:
+
+    joined = " ".join(str(x) for x in cells)
+    # Evitar encabezados.
+    if re.search(r"fecha|hora|sis|dia|pam|comentario", joined, re.I):
         return None
 
-    pas_c = _numeric_candidates_from_cell(cells[3], 60, 260)
-    pad_c = _numeric_candidates_from_cell(cells[4], 25, 150)
-    fc_c  = _numeric_candidates_from_cell(cells[5], 30, 180)
-    # A veces OCR une PAM y PP; mirar también celdas vecinas.
-    pam_c = _numeric_candidates_from_cell(cells[6], 40, 180)
-    pp_c  = _numeric_candidates_from_cell(cells[7] if len(cells)>7 else "", 10, 180)
-    if not pp_c and len(cells) > 6:
-        pp_c = _numeric_candidates_from_cell(" ".join(cells[6:8]), 10, 180)
+    nro_c = _numeric_candidates_from_cell(cells[0] if len(cells) > 0 else "", 1, 300)
+    fecha = _normalize_date_token(cells[1] if len(cells) > 1 else "", reference_year=reference_year)
+    hora = _normalize_time_token(cells[2] if len(cells) > 2 else "")
+    if not hora:
+        return None
+
+    pas_c = _numeric_candidates_from_cell(cells[3] if len(cells) > 3 else "", 55, 260)
+    pad_c = _numeric_candidates_from_cell(cells[4] if len(cells) > 4 else "", 25, 150)
+    fc_c  = _numeric_candidates_from_cell(cells[5] if len(cells) > 5 else "", 30, 190)
+    pam_c = _numeric_candidates_from_cell(cells[6] if len(cells) > 6 else "", 40, 180)
+    pp_c  = _numeric_candidates_from_cell(cells[7] if len(cells) > 7 else "", 5, 180)
+
+    # Candidatos por relación fisiológica.
+    # PP = PAS - PAD ; PAM ~= (PAS + 2*PAD) / 3
+    pas_aug, pad_aug, pp_aug, pam_aug = set(pas_c), set(pad_c), set(pp_c), set(pam_c)
+
+    for pas in list(pas_aug):
+        for pp in list(pp_aug):
+            pad = pas - pp
+            if 25 <= pad <= 150:
+                pad_aug.add(int(round(pad)))
+        for pam in list(pam_aug):
+            pad = (3*pam - pas) / 2
+            if 25 <= pad <= 150:
+                pad_aug.add(int(round(pad)))
+
+    for pad in list(pad_aug):
+        for pp in list(pp_aug):
+            pas = pad + pp
+            if 55 <= pas <= 260:
+                pas_aug.add(int(round(pas)))
+        for pam in list(pam_aug):
+            pas = 3*pam - 2*pad
+            if 55 <= pas <= 260:
+                pas_aug.add(int(round(pas)))
+
+    for pas in list(pas_aug):
+        for pad in list(pad_aug):
+            if pas > pad:
+                pp = pas - pad
+                if 5 <= pp <= 180:
+                    pp_aug.add(int(round(pp)))
+                pam = (pas + 2*pad) / 3
+                if 40 <= pam <= 180:
+                    pam_aug.add(int(round(pam)))
+
+    pas_list = sorted(pas_aug)[:30]
+    pad_list = sorted(pad_aug)[:30]
+    fc_list  = sorted(fc_c)[:20] or [np.nan]
+    pam_list = sorted(pam_aug)[:30] or [np.nan]
+    pp_list  = sorted(pp_aug)[:30] or [np.nan]
 
     best = None
-    for pas in pas_c[:12]:
-        for pad in pad_c[:12]:
-            if pas <= pad:
+    for pas in pas_list:
+        for pad in pad_list:
+            if not (55 <= pas <= 260 and 25 <= pad <= 150 and pas > pad):
                 continue
-            for fc in (fc_c[:10] or [np.nan]):
-                for pam in (pam_c[:10] or [round(pad + (pas-pad)/3)]):
-                    for pp in (pp_c[:10] or [pas-pad]):
-                        score = abs(pp - (pas-pad))*3 + abs(pam - (pad + (pas-pad)/3))*2
-                        # penalizar imposibles sin descartar: después se depuran por criterios MAPA
-                        if pp < 10 or pp > 160:
-                            score += 100
-                        if pas > 230 or pad > 130:
+            calc_pp = pas - pad
+            calc_pam = (pas + 2*pad) / 3
+            for fc in fc_list:
+                for pam in pam_list:
+                    if pd.isna(pam):
+                        pam = round(calc_pam)
+                    for pp in pp_list:
+                        if pd.isna(pp):
+                            pp = calc_pp
+
+                        # Penalización por incoherencia. No se descarta por PP fuera de rango
+                        # porque después clean_data aplica los criterios obligatorios.
+                        score = 0.0
+                        score += abs(float(pp) - calc_pp) * 2.5
+                        score += abs(float(pam) - calc_pam) * 1.8
+
+                        # Preferir valores que salieron directamente de su celda.
+                        if pas not in pas_c: score += 8
+                        if pad not in pad_c: score += 10
+                        if not pd.isna(fc) and fc not in fc_c: score += 4
+                        if pam_c and pam not in pam_c: score += 4
+                        if pp_c and pp not in pp_c: score += 4
+
+                        # Penalizar fisiológicamente raro, pero permitir para depuración posterior.
+                        if pas > 230 or pad > 130 or pp < 10 or pp > 120:
                             score += 15
-                        cand = (score, pas, pad, fc, pam, pp)
-                        if best is None or cand < best:
+                        if calc_pp < 8:
+                            score += 40
+
+                        cand = (score, int(round(pas)), int(round(pad)),
+                                float(fc) if not pd.isna(fc) else np.nan,
+                                int(round(pam)), int(round(pp)))
+                        if best is None or cand[0] < best[0]:
                             best = cand
-    if best is None or best[0] > 140:
+
+    if best is None:
         return None
-    _, pas, pad, fc, pam, pp = best
+
+    score, pas, pad, fc, pam, pp = best
+    # Umbral de score suficientemente amplio para OCR ruidoso pero no para filas basura.
+    if score > 75:
+        return None
+
     return {
-        "fecha": fecha, "hora": hora, "PAS": pas, "PAD": pad,
-        "FC": fc, "PAM": pam, "PP": pp,
-        "Período": "Nocturno" if re.search(r"noche|noct", " ".join(cells), re.I) else "",
-        "motivo": " ".join(cells)
+        "nro": int(nro_c[0]) if nro_c else None,
+        "fecha": fecha or "",
+        "hora": hora,
+        "PAS": pas,
+        "PAD": pad,
+        "FC": fc,
+        "PAM": pam,
+        "PP": pp,
+        "Período": "Nocturno" if re.search(r"noche|noct", joined, re.I) else "",
+        "motivo": joined.strip()
     }
 
 
-def _ocr_medicaldb_table_layout(pdf_file, dpi=220):
+def _ocr_medicaldb_table_layout(pdf_file, dpi=170, last_pages=2):
     """
-    OCR por layout de la 'Tabla Completa' de MedicalDB.
-    Usa detección de grilla para evitar leer promedios horarios o estadísticas.
-    Es más robusto que OCR lineal cuando la tabla está escaneada.
+    OCR por grilla de las páginas finales de la Tabla Completa MedicalDB.
+    Optimizado para velocidad: detecta la grilla, recorta SOLO la tabla y ejecuta
+    Tesseract con timeout por página. No recorre páginas sin tabla.
     """
     try:
         import fitz
@@ -611,32 +846,30 @@ def _ocr_medicaldb_table_layout(pdf_file, dpi=220):
     pdf_file.seek(0)
     data = pdf_file.read()
     doc = fitz.open(stream=data, filetype="pdf")
-    zoom = dpi / 72.0
-    mat = fitz.Matrix(zoom, zoom)
+    mat = fitz.Matrix(dpi/72.0, dpi/72.0)
 
-    # texto liviano para año de referencia
     try:
-        ref_text = _ocr_pdf_pages(io.BytesIO(data), dpi=150)
+        ref_text = _ocr_metadata_pages(io.BytesIO(data), dpi=150, max_pages=2)
     except Exception:
         ref_text = ""
     ref_year = _study_reference_year(ref_text)
 
     all_rows = []
-    for pno, page in enumerate(doc):
-        # MedicalDB suele tener tablas completas en las últimas páginas, pero no asumimos.
+    start_page = max(0, len(doc) - int(last_pages or 2))
+
+    for pno in range(start_page, len(doc)):
+        page = doc[pno]
         pix = page.get_pixmap(matrix=mat, alpha=False)
         img = _np.frombuffer(pix.samples, dtype=_np.uint8).reshape(pix.height, pix.width, pix.n)
         if pix.n == 4:
             img = cv2.cvtColor(img, cv2.COLOR_RGBA2RGB)
-
         gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
         h, w = gray.shape
 
-        # detectar líneas de grilla
         bin_img = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
                                         cv2.THRESH_BINARY_INV, 31, 15)
-        v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(20, h//85)))
-        h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(20, w//85), 1))
+        v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(18, h//85)))
+        h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(18, w//85), 1))
         vert = cv2.morphologyEx(bin_img, cv2.MORPH_OPEN, v_kernel, iterations=1)
         hor  = cv2.morphologyEx(bin_img, cv2.MORPH_OPEN, h_kernel, iterations=1)
 
@@ -644,53 +877,78 @@ def _ocr_medicaldb_table_layout(pdf_file, dpi=220):
         contours, _ = cv2.findContours(vert, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         for c in contours:
             x, y, ww, hh = cv2.boundingRect(c)
-            if hh > h*0.18 and ww < 25:
+            if hh > h*0.16 and ww < max(25, w*0.015):
                 xs.append(x + ww//2)
         contours, _ = cv2.findContours(hor, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         for c in contours:
             x, y, ww, hh = cv2.boundingRect(c)
-            if ww > w*0.50 and hh < 25:
+            if ww > w*0.45 and hh < max(25, h*0.01):
                 ys.append(y + hh//2)
 
-        xs = _merge_positions(xs, max(8, int(w*0.006)))
-        ys = _merge_positions(ys, max(8, int(h*0.004)))
+        xs = _merge_positions(xs, max(6, int(w*0.006)))
+        ys = _merge_positions(ys, max(6, int(h*0.004)))
         if len(xs) < 8 or len(ys) < 8:
             continue
 
-        # OCR de página a data frame de palabras con coordenadas
-        try:
-            data_ocr = pytesseract.image_to_data(gray, lang="spa+eng", config="--oem 3 --psm 6", output_type=Output.DICT)
-        except Exception:
-            data_ocr = pytesseract.image_to_data(gray, lang="eng", config="--oem 3 --psm 6", output_type=Output.DICT)
+        # Recorte de la grilla, con margen mínimo.
+        x0, x1 = max(0, xs[0]-8), min(w, xs[-1]+8)
+        y0, y1 = max(0, ys[0]-8), min(h, ys[-1]+8)
+        crop = gray[y0:y1, x0:x1]
 
-        cells = [[[] for _ in range(len(xs)-1)] for __ in range(len(ys)-1)]
+        # Coordenadas de grilla relativas al recorte.
+        rxs = [x - x0 for x in xs]
+        rys = [y - y0 for y in ys]
+
+        # OCR de la tabla recortada. English suele ser más rápido y suficiente para números/Noche.
+        try:
+            data_ocr = pytesseract.image_to_data(
+                crop,
+                lang="eng",
+                config="--oem 3 --psm 6",
+                output_type=Output.DICT,
+                timeout=7
+            )
+        except RuntimeError:
+            continue
+        except Exception:
+            try:
+                data_ocr = pytesseract.image_to_data(
+                    crop,
+                    config="--oem 3 --psm 6",
+                    output_type=Output.DICT,
+                    timeout=7
+                )
+            except Exception:
+                continue
+
+        cells = [[[] for _ in range(len(rxs)-1)] for __ in range(len(rys)-1)]
         for i, word in enumerate(data_ocr.get("text", [])):
             word = str(word).strip()
             if not word:
                 continue
             try:
-                if float(data_ocr.get("conf", [0])[i]) < 0:
+                if float(data_ocr.get("conf", [0])[i]) < -1:
                     continue
             except Exception:
                 pass
             cx = data_ocr["left"][i] + data_ocr["width"][i] / 2
             cy = data_ocr["top"][i] + data_ocr["height"][i] / 2
-            ci = next((j for j in range(len(xs)-1) if xs[j] <= cx <= xs[j+1]), None)
-            ri = next((j for j in range(len(ys)-1) if ys[j] <= cy <= ys[j+1]), None)
+            ci = next((j for j in range(len(rxs)-1) if rxs[j] <= cx <= rxs[j+1]), None)
+            ri = next((j for j in range(len(rys)-1) if rys[j] <= cy <= rys[j+1]), None)
             if ci is not None and ri is not None:
                 cells[ri][ci].append(word)
 
         cell_text = [[" ".join(x) for x in row] for row in cells]
 
-        # encontrar fila encabezado
         header_i = None
         for i, row in enumerate(cell_text):
             joined = " ".join(row[:10]).lower()
-            if ("fecha" in joined and "hora" in joined) or ("sis" in joined and "dia" in joined):
+            if ("fecha" in joined and "hora" in joined) or ("sis" in joined and ("dia" in joined or "dla" in joined)):
                 header_i = i
                 break
         if header_i is None:
-            continue
+            # En algunos OCR el encabezado queda ilegible; asumir primera fila después del título.
+            header_i = 1 if len(cell_text) > 3 else 0
 
         page_rows = []
         for row in cell_text[header_i+1:]:
@@ -705,12 +963,13 @@ def _ocr_medicaldb_table_layout(pdf_file, dpi=220):
     if not all_rows:
         return None
     df = pd.DataFrame(all_rows)
-    df = df.drop_duplicates(subset=["fecha","hora","PAS","PAD"], keep="first")
+    subset = [c for c in ["hora","PAS","PAD","PAM","PP"] if c in df.columns]
+    if subset:
+        df = df.drop_duplicates(subset=subset, keep="first")
     for c in ["PAS","PAD","FC","PAM","PP"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
     df = df.dropna(subset=["PAS","PAD"])
     return df if len(df) >= 10 else None
-
 
 def _extract_ints_after(text):
     vals = []
@@ -852,33 +1111,82 @@ def _parse_medicaldb_table_text(text):
     df = df.dropna(subset=["PAS","PAD"])
     return df if len(df) >= 10 else None
 
+
 def _ensure_datetime_sequence(df, meta=None):
-    df = df.copy()
-    # datetime real si hay fecha
+    """
+    Construye eje temporal cronológico.
+    Para PDFs MedicalDB OCR se prioriza el ORDEN DE FILA y la fecha de inicio
+    del estudio, porque el OCR puede leer 04/06 como 05/06 en alguna celda.
+    """
+    df = df.copy().reset_index(drop=True)
+    meta = meta or {}
+
+    # Usar orden de fila si existe.
+    if 'nro' in df.columns:
+        try:
+            df['nro'] = pd.to_numeric(df['nro'], errors='coerce')
+            if df['nro'].notna().sum() >= max(5, len(df)//2):
+                df = df.sort_values('nro').reset_index(drop=True)
+        except Exception:
+            pass
+
+    # Base desde fecha/hora de inicio si está disponible.
+    base_date = None
+    try:
+        if meta.get("fecha_inicio"):
+            base_date = datetime.strptime(meta["fecha_inicio"], "%d/%m/%Y").date()
+    except Exception:
+        base_date = None
+
+    mins = df["hora"].apply(time_to_minutes).astype(float) if "hora" in df.columns else pd.Series([np.nan]*len(df))
+    corrected = []
+    offset = 0
+    prev = None
+    for m in mins:
+        if pd.isna(m):
+            corrected.append(np.nan)
+            continue
+        m2 = float(m) + offset
+        if prev is not None and m2 < prev - 360:
+            offset += 1440
+            m2 = float(m) + offset
+        corrected.append(m2)
+        prev = m2
+
+    # Si existe base_date, crear dt desde base + minutos; ajustar si la primera hora
+    # de tabla es anterior a hora_inicio por muchas horas.
+    if base_date is not None and len(corrected) > 0 and not pd.isna(corrected[0]):
+        start_min = time_to_minutes(meta.get("hora_inicio", "")) if meta.get("hora_inicio") else None
+        first_min = corrected[0]
+        base_dt = datetime.combine(base_date, datetime.min.time())
+        if start_min is not None:
+            # anclar el día al horario de la primera lectura; si primera lectura está
+            # antes del inicio por >6 h, asumir que corresponde al día siguiente.
+            add_day = 1 if first_min < start_min - 360 else 0
+            base_dt = base_dt + pd.Timedelta(days=add_day)
+        df["dt"] = [base_dt + pd.Timedelta(minutes=float(x)) if not pd.isna(x) else pd.NaT for x in corrected]
+        df["tplot"] = [(x - df["dt"].dropna().iloc[0]).total_seconds()/60 if pd.notna(x) and df["dt"].notna().any() else np.nan for x in df["dt"]]
+        df["hora_label"] = df["hora"].astype(str).str.slice(0,5)
+        # Completar/normalizar fecha según dt calculado.
+        df["fecha"] = [x.strftime("%d/%m/%Y") if pd.notna(x) else "" for x in df["dt"]]
+        return df
+
+    # Fallback: si hay fechas confiables, usarlas.
     if "fecha" in df.columns:
         dt = pd.to_datetime(df["fecha"].astype(str) + " " + df["hora"].astype(str),
                             dayfirst=True, errors="coerce")
     else:
         dt = pd.Series([pd.NaT]*len(df))
+
     if dt.notna().sum() >= max(5, len(df)//2):
         df["dt"] = dt
-        df = df.sort_values("dt").reset_index(drop=True)
+        # No ordenar por fecha si hay nro: ya se ordenó por fila.
+        if 'nro' not in df.columns:
+            df = df.sort_values("dt").reset_index(drop=True)
         base = df["dt"].dropna().iloc[0]
         df["tplot"] = (df["dt"] - base).dt.total_seconds() / 60.0
         df["hora_label"] = df["dt"].dt.strftime("%H:%M")
     else:
-        # Usar orden de fila y corregir cruce de medianoche.
-        mins = df["hora"].apply(time_to_minutes).astype(float)
-        corrected = []
-        offset = 0
-        prev = None
-        for m in mins:
-            if pd.isna(m):
-                corrected.append(np.nan); continue
-            if prev is not None and (m + offset) < prev - 360:
-                offset += 1440
-            corrected.append(m + offset)
-            prev = m + offset
         df["tplot"] = corrected
         df["hora_label"] = df["hora"].astype(str).str.slice(0,5)
     return df
@@ -1226,80 +1534,174 @@ def _parse_zlogic_table(text):
     df = df.dropna(subset=["PAS", "PAD"])
     return df if len(df) >= 10 else None
 
+
 def _extract_meta(text):
-    """Extrae filiatorios automáticamente desde PDF/OCR del equipo MedicalDB."""
+    """
+    Extrae filiatorios y datos del estudio desde OCR/texto MedicalDB.
+    Corrige los fallos más frecuentes del OCR y también lee los informes ya
+    generados por la app cuando se usan como comparación.
+    """
     meta = {}
     if not text:
         return meta
 
-    # Normalizaciones OCR mínimas para etiquetas, no para valores.
-    t = re.sub(r"[ \t]+", " ", text)
-    t_label = (t.replace("Macimiento", "Nacimiento")
-                 .replace("Mocimiento", "Nacimiento")
-                 .replace("Múmero", "Número")
-                 .replace("Glorla", "GLORIA")
-                 .replace("GLOETA", "GLORIA"))
+    t = text.replace("\r", "\n")
+    t = re.sub(r"[ \t]+", " ", t)
+    # Normalización de etiquetas frecuentes.
+    repl = {
+        "Macimiento": "Nacimiento", "Mocimiento": "Nacimiento",
+        "Nacimienta": "Nacimiento", "Nacimicnto": "Nacimiento",
+        "Múmero": "Número", "Numero": "Número",
+        "Obra Soclal": "Obra Social", "Obra soclal": "Obra Social",
+        "Obra Sccial": "Obra Social", "Oora Social": "Obra Social",
+        "Seco:": "Sexo:", "Saxo:": "Sexo:", "Sexo :": "Sexo:",
+        "Iniclo": "Inicio", "lInicio": "Inicio",
+        "Finalizacion": "Finalización", "Finalizacién": "Finalización",
+    }
+    for a, b in repl.items():
+        t = t.replace(a, b)
 
-    ref_year = _study_reference_year(t_label)
+    lines = [re.sub(r"\s+", " ", ln).strip() for ln in t.splitlines() if ln.strip()]
+    flat = "\n".join(lines)
+    flat_space = re.sub(r"\s+", " ", flat)
 
-    # Paciente / Apellido y Nombre
-    pats = [
-        r"Apellido\s*y\s*Nombre[:\s]+([A-ZÁÉÍÓÚÑa-záéíóúñ ]+?)(?:\*|Documento|Domicilio|\n)",
-        r"Paciente[:\s]+([A-ZÁÉÍÓÚÑa-záéíóúñ ]+?)(?:\*|Fecha|Documento|Domicilio|\n)",
+    ref_year = _study_reference_year(flat_space)
+
+    # Paciente / Apellido y Nombre.
+    patient_patterns = [
+        r"Apellido\s*y\s*Nombre[:\s]+(.+?)(?:\*|Documento|Domicilio|Localidad|Fecha\s+de\s+Nacimiento|\n)",
+        r"Paciente[:\s]+(.+?)(?:\*|Fecha|Documento|Domicilio|Localidad|\n)",
+        r"Paciente[:\s]+([A-ZÁÉÍÓÚÑ ]{5,})",
     ]
-    for pat in pats:
-        m = re.search(pat, t_label, re.IGNORECASE)
+    for pat in patient_patterns:
+        m = re.search(pat, flat, re.I | re.S)
+        if not m:
+            m = re.search(pat, flat_space, re.I | re.S)
         if m:
-            nombre = re.sub(r"[^A-Za-zÁÉÍÓÚÑáéíóúñ ]", " ", m.group(1))
+            nombre = m.group(1)
+            nombre = re.sub(r"[^A-Za-zÁÉÍÓÚÑáéíóúñ ]", " ", nombre)
             nombre = re.sub(r"\s+", " ", nombre).strip().upper()
-            if len(nombre) >= 5 and "MONITOREO" not in nombre:
+            bad = ["MONITOREO", "AMBULATORIO", "PRESION", "PRESIÓN", "ARTERIAL", "M A P A"]
+            if len(nombre) >= 5 and not any(b in nombre for b in bad):
                 meta["paciente"] = nombre
                 break
 
-    # Documento
-    m = re.search(r"Documento[:\s]+(\d{6,10})", t_label, re.I)
+    # Documento.
+    m = re.search(r"Documento[:\s]+([0-9]{6,10})", flat_space, re.I)
     if m:
         meta["documento"] = m.group(1)
 
-    # Fecha de nacimiento y edad calculada
-    m = re.search(r"Fecha\s+de\s+Nacimiento[:\s]+(\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4})", t_label, re.I)
+    # Fecha de nacimiento.
+    m = re.search(r"Fecha\s+de\s+Nacimiento[:\s]+(\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4})", flat_space, re.I)
     if m:
         fnac = _normalize_date_token(m.group(1), prefer_birth=True)
-        meta["fecha_nacimiento"] = fnac
+        if fnac:
+            meta["fecha_nacimiento"] = fnac
 
-    # Sexo: permitir OCR parcial; si no figura M/F, dejar no especificado.
-    m = re.search(r"Sexo[:\s]+([MF])\b", t_label, re.I)
+    # Sexo: MedicalDB a veces lo deja en blanco. No inventar.
+    m = re.search(r"Sexo[:\s]*([MF])(?:\b|[^A-Za-z])", flat_space, re.I)
     if m:
         meta["sexo"] = "Femenino" if m.group(1).upper() == "F" else "Masculino"
+    elif re.search(r"Sexo[:\s]*(?:Peso|Obra|Datos|$)", flat_space, re.I):
+        meta["sexo"] = "No consignado"
 
-    # Obra social
-    m = re.search(r"Obra\s+Social[:\s]+([A-ZÁÉÍÓÚÑa-záéíóúñ0-9 ._-]+?)(?:Número|Numero|Múmero|Datos del estudio|\n)", t_label, re.I)
-    if m:
-        osoc = re.sub(r"[^A-ZÁÉÍÓÚÑa-záéíóúñ0-9 ._-]", "", m.group(1)).strip().upper()
-        osoc = re.sub(r"\s+", " ", osoc).strip(" -—")
-        if osoc:
-            meta["obra_social"] = osoc
+    # Obra social. Cortar antes de Número/Datos del estudio y tolerar minúsculas.
+    os_patterns = [
+        r"Obra\s+Social[:\s]+(.+?)(?:\s+Número|\s+Numero|\s+N[uú]mero|\s+Datos\s+del\s+estudio|\n)",
+        r"Obra\s+social[:\s]+([A-Za-zÁÉÍÓÚÑáéíóúñ0-9 ._-]{2,40})",
+    ]
+    for pat in os_patterns:
+        m = re.search(pat, flat, re.I | re.S)
+        if not m:
+            m = re.search(pat, flat_space, re.I | re.S)
+        if m:
+            osoc = m.group(1)
+            osoc = re.sub(r"[^A-Za-zÁÉÍÓÚÑáéíóúñ0-9 ._-]", " ", osoc)
+            osoc = re.sub(r"\s+", " ", osoc).strip(" -—:.").upper()
+            # Evitar que el OCR arrastre etiquetas.
+            osoc = re.split(r"\b(DATOS|FECHA|INICIO|SOLICITADO|MOTIVO|N[ÚU]MERO)\b", osoc)[0].strip(" -—:.")
+            if osoc and len(osoc) <= 40 and osoc not in ["NO", "NO CONSIGNADO"]:
+                meta["obra_social"] = osoc
+                break
 
-    # Inicio / Fin; corregir año por portada si OCR lee 2006 en lugar de 2026.
+    # Informes ya generados por la app: "Obra social: IOMA Fecha del estudio..."
+    if "obra_social" not in meta:
+        m = re.search(r"Obra\s+social[:\s]+(.+?)\s+Fecha\s+del\s+estudio", flat_space, re.I)
+        if m:
+            osoc = re.sub(r"\s+", " ", m.group(1)).strip().upper()
+            if osoc:
+                meta["obra_social"] = osoc
+
+    # Fechas y horas del estudio.
+    # MedicalDB: Inicio: 04/06/2026 12:45:00 Fin: 05/06/2026 08:17:00
     m = re.search(
         r"Inicio[:\s]+(\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4})\s+(\d{1,2}:\d{2}(?::\d{2})?)\s+Fin[:\s]+(\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4})\s+(\d{1,2}:\d{2}(?::\d{2})?)",
-        t_label, re.I)
+        flat_space, re.I)
     if m:
         meta["fecha_inicio"] = _normalize_date_token(m.group(1), reference_year=ref_year)
         meta["hora_inicio"] = _normalize_time_token(m.group(2))
         meta["fecha_fin"] = _normalize_date_token(m.group(3), reference_year=ref_year)
         meta["hora_fin"] = _normalize_time_token(m.group(4))
     else:
-        # Portada o datos de estudio.
-        dates = re.findall(r"\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}", t_label)
-        if dates:
-            # preferir la fecha de portada si aparece luego de "Paciente"
-            meta["fecha_inicio"] = _normalize_date_token(dates[0], reference_year=ref_year)
+        # Informe generado: Inicio: 04/06/2026 12:45 Finalización: 05/06/2026 08:17
+        m = re.search(
+            r"Inicio[:\s]+(\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4})\s+(\d{1,2}:\d{2}).{0,40}Finalizaci[oó]n[:\s]+(\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4})\s+(\d{1,2}:\d{2})",
+            flat_space, re.I)
+        if m:
+            meta["fecha_inicio"] = _normalize_date_token(m.group(1), reference_year=ref_year)
+            meta["hora_inicio"] = _normalize_time_token(m.group(2))
+            meta["fecha_fin"] = _normalize_date_token(m.group(3), reference_year=ref_year)
+            meta["hora_fin"] = _normalize_time_token(m.group(4))
+
+    # Fecha del estudio o portada.
+    m = re.search(r"Fecha\s+del\s+estudio[:\s]+(\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4})", flat_space, re.I)
+    if m and "fecha_inicio" not in meta:
+        meta["fecha_inicio"] = _normalize_date_token(m.group(1), reference_year=ref_year)
+
+    if "fecha_inicio" not in meta:
+        m = re.search(r"Paciente:.*?Fecha[:\s]+(\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4})", flat_space, re.I | re.S)
+        if not m:
+            m = re.search(r"\bFecha[:\s]+(\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4})", flat_space, re.I)
+        if m:
+            meta["fecha_inicio"] = _normalize_date_token(m.group(1), reference_year=ref_year)
 
     if meta.get("fecha_inicio") and not meta.get("fecha_fin") and meta.get("hora_fin"):
         meta["fecha_fin"] = meta["fecha_inicio"]
 
-    # Edad desde fecha nacimiento y fecha del estudio.
+    # Si no se detectaron horas de inicio/fin, intentar desde "Hora inicio" estadística.
+    if "hora_inicio" not in meta:
+        m = re.search(r"Hora\s+inicio[:\s]+(\d{1,2}:\d{2})", flat_space, re.I)
+        if m:
+            meta["hora_inicio"] = _normalize_time_token(m.group(1))
+    if "hora_fin" not in meta:
+        m = re.search(r"Hora\s+Fin[:\s]+(\d{1,2}:\d{2})", flat_space, re.I)
+        if m:
+            meta["hora_fin"] = _normalize_time_token(m.group(1))
+
+    # Duración.
+    m = re.search(r"(?:Tiempo\s+de\s+estudio|Duraci[oó]n\s+efectiva)[:\s]+(.+?)(?:L[ií]mites|Total|Solicitante|Lecturas|\n)", flat_space, re.I)
+    if m:
+        meta["duracion"] = re.sub(r"\s+", " ", m.group(1)).strip(" .")
+
+    # Dispositivo.
+    for dev in ["MedicalDB 17.7", "MedicalDB", "SpaceLabs", "Microlife", "OMRON", "Schiller", "Welch Allyn", "A&D"]:
+        if dev.lower() in flat_space.lower():
+            meta["dispositivo"] = dev
+            break
+
+    # Solicitante y motivo.
+    m = re.search(r"Solicitado\s+por[:\s]+(.+?)(?:\s+Motivo|\n|Frecuencia)", flat_space, re.I)
+    if m:
+        val = re.sub(r"\s+", " ", m.group(1)).strip(" :.-").upper()
+        if val:
+            meta["solicitante"] = val
+    m = re.search(r"Motivo[:\s]+(.+?)(?:\s+Informe|\n|Frecuencia|Lecturas)", flat_space, re.I)
+    if m:
+        val = re.sub(r"\s+", " ", m.group(1)).strip(" :.-").upper()
+        if val:
+            meta["motivo"] = val
+
+    # Edad.
     try:
         if meta.get("fecha_nacimiento") and meta.get("fecha_inicio"):
             fn = datetime.strptime(meta["fecha_nacimiento"], "%d/%m/%Y")
@@ -1310,31 +1712,7 @@ def _extract_meta(text):
     except Exception:
         pass
 
-    # Dispositivo
-    for dev in ["MedicalDB 17.7", "MedicalDB", "SpaceLabs", "Microlife", "OMRON", "Schiller", "Welch Allyn", "A&D"]:
-        if dev.lower() in t_label.lower():
-            meta["dispositivo"] = dev
-            break
-
-    # Solicitante y motivo
-    m = re.search(r"Solicitado\s+por[:\s]+(.+?)(?:Motivo|\n)", t_label, re.I)
-    if m:
-        val = re.sub(r"\s+", " ", m.group(1)).strip().upper()
-        if val:
-            meta["solicitante"] = val
-    m = re.search(r"Motivo[:\s]+(.+?)(?:Informe|\n)", t_label, re.I)
-    if m:
-        val = re.sub(r"\s+", " ", m.group(1)).strip().upper()
-        if val:
-            meta["motivo"] = val
-
-    # Duración si figura
-    m = re.search(r"Tiempo\s+de\s+estudio[:\s]+(.+?)(?:L[ií]mites|Total|\n)", t_label, re.I)
-    if m:
-        meta["duracion"] = re.sub(r"\s+", " ", m.group(1)).strip()
-
     return meta
-
 
 def assign_periods(df, noc_start=23, noc_end=7):
     df = df.copy()
