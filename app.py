@@ -53,7 +53,7 @@ THRESHOLDS = {
     'nocturno': {'sys': 120, 'dia': 70},
 }
 
-OUTLIER = {'PAD_min': 40, 'PAD_max': 130, 'PAS_max': 230, 'PP_max': 80, 'PP_min': 20}
+OUTLIER = {'PAD_min': 40, 'PAD_max': 130, 'PAS_max': 230, 'PP_max': 80, 'PP_min': 10}
 
 DOCTOR_NAME     = "Ricardo Daniel Olano"
 DOCTOR_TITLE    = "Especialista Universitario en Cardiología"
@@ -248,6 +248,13 @@ def parse_mapa_pdf(pdf_file):
     if df is None or len(df) < 20:
         df = _parse_medicaldb_table_text(full_text)
 
+    # 3.5) Parser ZLogic/MedicalDB 17.7 – formato celdas | y [ con OCR ruidoso
+    if df is None or len(df) < 20:
+        df_zl = _parse_zlogic_table(full_text)
+        if df_zl is not None and len(df_zl) > (len(df) if df is not None else 0):
+            df = df_zl
+            diagnostics.append(f"ZLogic parser: {len(df_zl)} lecturas")
+
     # 4) Segunda opción: tablas digitales del PDF original
     if df is None or len(df) < 20:
         df_tbl = _parse_from_tables(all_tables)
@@ -275,12 +282,21 @@ def parse_mapa_pdf(pdf_file):
     meta = _extract_meta(full_text)
 
     if df is None or len(df) < 10:
-        msg = (
-            "No se pudo importar una TABLA COMPLETA válida desde el PDF original. "
-            "El archivo parece no contener lecturas crudas suficientes, o se cargó un informe ya generado "
-            "en lugar del PDF original del equipo MedicalDB. "
-            + " | ".join(diagnostics)
-        )
+        if _is_generated_report:
+            pac = full_text.split("Paciente:")[1].split("\n")[0].strip() if "Paciente:" in full_text else "no identificado"
+            msg = (
+                "⚠️ El PDF cargado es un INFORME YA GENERADO por esta app, no el PDF original del equipo MAPA. "
+                "Para procesar un nuevo informe, suba el PDF ORIGINAL del equipo MedicalDB 17.7 "
+                "(el que contiene la Tabla Completa con las lecturas individuales de presión arterial). "
+                f"Paciente detectado en el informe: {pac}"
+            )
+        else:
+            msg = (
+                "No se pudo importar una TABLA COMPLETA válida desde el PDF original. "
+                "El archivo no contiene lecturas crudas suficientes. "
+                "Verifique en Diagnóstico técnico que el OCR contiene filas con hora y valores numéricos. "
+                + " | ".join(diagnostics)
+            )
         return None, msg, full_text
 
     # Ordenar por número de fila si existe; si no, preservar orden de lectura.
@@ -963,7 +979,8 @@ def _parse_numeric_pairs(text):
     """
     Parser de último recurso para texto OCR con formato irregular.
     Busca hora hh:mm + par numérico PAS/PAD plausible en cada línea.
-    No requiere fechas ni estructura de tabla; tolera OCR muy ruidoso.
+    Aplica _num_clean_token para recuperar dígitos de strings mixtos
+    como '11s'→115, 'ss'→55, 'iio'→110 (ZLogic/MedicalDB).
     """
     readings = []
     for line in text.splitlines():
@@ -974,8 +991,19 @@ def _parse_numeric_pairs(text):
         if h > 23 or mi > 59:
             continue
         hora = f"{h:02d}:{mi:02d}"
-        nums = [int(n) for n in re.findall(r'\b(\d{2,3})\b', line)
-                if 30 <= int(n) <= 260]
+        # Aplicar _num_clean_token a cada token separado por espacios/separadores
+        # antes de buscar números, para recuperar dígitos en strings mixtos.
+        clean_tokens = []
+        for tok in re.split(r'[\s|\[\]{}]+', line):
+            if not tok:
+                continue
+            c = _num_clean_token(tok)
+            # Extraer secuencias de 2-3 dígitos del token limpio
+            for m in re.finditer(r'\d{2,3}', c):
+                v = int(m.group())
+                if 30 <= v <= 260:
+                    clean_tokens.append(v)
+        nums = clean_tokens
         for i in range(len(nums) - 1):
             pas, pad = nums[i], nums[i + 1]
             if 80 <= pas <= 220 and 40 <= pad <= 130 and pas > pad + 10:
@@ -991,6 +1019,110 @@ def _parse_numeric_pairs(text):
     df = df[df['PAS'].between(80, 220) & df['PAD'].between(40, 130)]
     return df if len(df) >= 5 else None
 
+
+
+def _parse_zlogic_table(text):
+    """
+    Parser dedicado para PDFs del equipo ZLogic / MedicalDB 17.7.
+    Maneja la 'Tabla Completa' con celdas separadas por | y [ con OCR ruidoso.
+    Estrategia: para cada línea con hora HH:MM, divide por separadores de celda,
+    aplica _num_clean_token a cada token y extrae PAS/PAD por posición o por
+    búsqueda de par plausible.
+    """
+    if not text:
+        return None
+
+    # Tomar texto desde "Tabla Completa" en adelante (puede haber 2 secciones).
+    low = text.lower()
+    chunks = []
+    for m in re.finditer(r"tabla\s+completa", low):
+        chunks.append(text[m.start(): m.start() + 12000])
+    if not chunks:
+        chunks = [text]
+
+    ref_year = _study_reference_year(text) or datetime.now().year
+    rows = []
+
+    for chunk in chunks:
+        for line in chunk.splitlines():
+            # La línea debe tener hora HH:MM (con segundos opcionales)
+            time_m = re.search(r'\b(\d{1,2}):(\d{2})(?::\d{2})?\b', line)
+            if not time_m:
+                continue
+            h, mi = int(time_m.group(1)), int(time_m.group(2))
+            if h > 23 or mi > 59:
+                continue
+            hora = f"{h:02d}:{mi:02d}"
+
+            # Dividir la línea por cualquier separador de celda: | [ ] { }
+            tokens = re.split(r'[|\[\]{}]', line)
+            tokens = [t.strip() for t in tokens if t.strip()]
+
+            # Buscar fecha: primer token que normalice como fecha válida
+            fecha = None
+            for tok in tokens:
+                c = _num_clean_token(tok)
+                fecha = _normalize_date_token(c, reference_year=ref_year)
+                if fecha:
+                    break
+            # Si no se encontró fecha como token, buscar en texto completo de la línea
+            if not fecha:
+                fecha = _normalize_date_token(_num_clean_token(line), reference_year=ref_year)
+
+            # Encontrar índice del token con la hora
+            time_idx = None
+            for i, tok in enumerate(tokens):
+                if re.search(r'\d{1,2}:\d{2}', tok):
+                    time_idx = i
+                    break
+
+            # Extraer números de los tokens POST-hora, usando _num_clean_token
+            post_tokens = tokens[time_idx + 1:] if time_idx is not None else tokens
+            nums = []
+            for tok in post_tokens[:10]:
+                c = _num_clean_token(tok)
+                for m2 in re.finditer(r'\d{2,3}', c):
+                    v = int(m2.group())
+                    if 20 <= v <= 260:
+                        nums.append(v)
+
+            if len(nums) < 2:
+                continue
+
+            # Buscar par PAS/PAD plausible
+            best = None
+            for i in range(len(nums) - 1):
+                pas, pad = nums[i], nums[i + 1]
+                if 80 <= pas <= 220 and 40 <= pad <= 130 and pas > pad + 10:
+                    fc  = nums[i+2] if i+2 < len(nums) and 30 <= nums[i+2] <= 180 else np.nan
+                    pam = nums[i+3] if i+3 < len(nums) else round(pad + (pas - pad) / 3)
+                    pp  = nums[i+4] if i+4 < len(nums) else pas - pad
+                    best = (pas, pad, fc, pam, pp)
+                    break
+
+            if best is None:
+                continue
+
+            pas, pad, fc, pam, pp = best
+            periodo = "Nocturno" if re.search(r'noche|noct', line, re.I) else ""
+            rows.append({
+                "nro": len(rows) + 1,
+                "fecha": fecha or "",
+                "hora": hora,
+                "PAS": pas, "PAD": pad, "FC": fc, "PAM": pam, "PP": pp,
+                "Período": periodo,
+                "motivo": line.strip()
+            })
+
+    if not rows:
+        return None
+
+    df = pd.DataFrame(rows)
+    df = df.drop_duplicates(subset=["hora", "PAS", "PAD"], keep="first")
+    for c in ["PAS", "PAD", "FC", "PAM", "PP"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = df.dropna(subset=["PAS", "PAD"])
+    return df if len(df) >= 10 else None
 
 def _extract_meta(text):
     """Extrae filiatorios automáticamente desde PDF/OCR del equipo MedicalDB."""
@@ -2011,15 +2143,24 @@ def main():
 
     df_raw, meta_or_err, raw_text_debug = result
     if df_raw is None:
-        st.error("No se pudo importar automáticamente el PDF.")
-        st.warning(meta_or_err)
-        with st.expander("Diagnóstico técnico"):
-            st.text_area("Texto/OCR obtenido", raw_text_debug[:6000] if raw_text_debug else "", height=250)
-            st.markdown("""
-            Para PDFs escaneados se requiere OCR instalado.  
-            **Local:** `pip install PyMuPDF Pillow pytesseract` y Tesseract OCR instalado en el sistema.  
-            **Streamlit Cloud:** subir `requirements.txt` y `packages.txt` junto con la app.
-            """)
+        is_gen = "⚠️ El PDF cargado es un INFORME YA GENERADO" in str(meta_or_err)
+        if is_gen:
+            st.warning(meta_or_err)
+            st.info(
+                "**¿Qué PDF necesita la app?** El PDF ORIGINAL del equipo MAPA (MedicalDB 17.7 u otro). "
+                "Es el archivo que genera el propio monitor de presión, antes de ser procesado. "
+                "Contiene la Tabla Completa con cada lectura individual hora a hora."
+            )
+        else:
+            st.error("No se pudo importar automáticamente el PDF.")
+            st.warning(meta_or_err)
+            with st.expander("Diagnóstico técnico"):
+                st.text_area("Texto/OCR obtenido", raw_text_debug[:6000] if raw_text_debug else "", height=250)
+                st.markdown("""
+                Para PDFs escaneados se requiere OCR instalado.  
+                **Local:** `pip install PyMuPDF Pillow pytesseract` y Tesseract OCR instalado en el sistema.  
+                **Streamlit Cloud:** subir `requirements.txt` y `packages.txt` junto con la app.
+                """)
         return
 
     meta = meta_or_err if isinstance(meta_or_err, dict) else {}
