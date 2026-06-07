@@ -53,7 +53,7 @@ THRESHOLDS = {
     'nocturno': {'sys': 120, 'dia': 70},
 }
 
-OUTLIER = {'PAD_min': 40, 'PAD_max': 130, 'PAS_max': 230, 'PP_max': 80, 'PP_min': 10}
+OUTLIER = {'PAD_min': 35, 'PAD_max': 130, 'PAS_max': 230, 'PP_max': 80, 'PP_min': 10}
 
 DOCTOR_NAME     = "Ricardo Daniel Olano"
 DOCTOR_TITLE    = "Especialista Universitario en Cardiología"
@@ -365,6 +365,7 @@ def _num_clean_token(tok):
     s = s.replace("↑", "").replace("]", "").replace("[", "").replace("|", "")
     s = s.replace("l", "1").replace("I", "1").replace("O", "0").replace("o", "0")
     s = s.replace("S", "5").replace("s", "5").replace("B", "8").replace("G", "6")
+    s = s.replace("z", "2").replace("Z", "2")
     s = re.sub(r"[^0-9/:.-]", "", s)
     return s
 
@@ -1025,9 +1026,12 @@ def _parse_zlogic_table(text):
     """
     Parser dedicado para PDFs del equipo ZLogic / MedicalDB 17.7.
     Maneja la 'Tabla Completa' con celdas separadas por | y [ con OCR ruidoso.
-    Estrategia: para cada línea con hora HH:MM, divide por separadores de celda,
-    aplica _num_clean_token a cada token y extrae PAS/PAD por posición o por
-    búsqueda de par plausible.
+    Detecta la hora en múltiples formatos OCR:
+      • HH:MM[:SS]   → dos puntos estándar
+      • HHMM.SS      → punto como separador de segundos (ej. 1845.00)
+      • HH-MM        → guión como separador (ej. 05-4500)
+      • HHMMSS       → 6 dígitos consecutivos aislados (ej. 174500)
+      • igual en versión OCR-limpia (ej. oo4s00 → 004500)
     """
     if not text:
         return None
@@ -1043,44 +1047,94 @@ def _parse_zlogic_table(text):
     ref_year = _study_reference_year(text) or datetime.now().year
     rows = []
 
+    def _find_time(line):
+        """Detecta HH:MM en línea OCR ZLogic con múltiples formatos. Retorna (hora, end_pos)."""
+        # Prioridad 1: HH:MM[:SS] con dos puntos estándar
+        m = re.search(r'(?<![/\d])(\d{1,2}):(\d{2})(?::\d{2})?', line)
+        if m:
+            h, mi = int(m.group(1)), int(m.group(2))
+            if h <= 23 and mi <= 59:
+                return f"{h:02d}:{mi:02d}", m.end()
+
+        # Prioridad 2: HHMM.SS (ej. 1845.00, 0415.00, 0745.00)
+        m = re.search(r'(?<!\d)(\d{2})(\d{2})\.(\d{2})(?!\d)', line)
+        if m:
+            h, mi = int(m.group(1)), int(m.group(2))
+            if h <= 23 and mi <= 59:
+                return f"{h:02d}:{mi:02d}", m.end()
+
+        # Prioridad 3: HH-MM (guión, ej. 05-4500, 06-0000)
+        m = re.search(r'(?<![/\d])(\d{2})-(\d{2})', line)
+        if m:
+            h, mi = int(m.group(1)), int(m.group(2))
+            if h <= 23 and mi <= 59:
+                return f"{h:02d}:{mi:02d}", m.end()
+
+        # Prioridad 4: HHMMSS exactos (6 dígitos aislados, ej. 174500, 211600)
+        for m in re.finditer(r'(?<!\d)(\d{2})(\d{2})(\d{2})(?!\d)', line):
+            h, mi, ss = int(m.group(1)), int(m.group(2)), int(m.group(3))
+            if h <= 23 and mi <= 59 and ss <= 59:
+                return f"{h:02d}:{mi:02d}", m.end()
+
+        # Prioridad 5: igual con sustituciones OCR (ej. oo4s00→004500, o14s00→014500)
+        lc = re.sub(r'[oO]', '0', line)
+        lc = re.sub(r'[lI]', '1', lc)
+        lc = re.sub(r'[sS]', '5', lc)
+        if lc != line:
+            m = re.search(r'(?<!\d)(\d{2})(\d{2})\.(\d{2})(?!\d)', lc)
+            if m:
+                h, mi = int(m.group(1)), int(m.group(2))
+                if h <= 23 and mi <= 59:
+                    return f"{h:02d}:{mi:02d}", m.end()
+            for m in re.finditer(r'(?<!\d)(\d{2})(\d{2})(\d{2})(?!\d)', lc):
+                h, mi, ss = int(m.group(1)), int(m.group(2)), int(m.group(3))
+                if h <= 23 and mi <= 59 and ss <= 59:
+                    return f"{h:02d}:{mi:02d}", m.end()
+
+        return None, -1
+
     for chunk in chunks:
         for line in chunk.splitlines():
-            # La línea debe tener hora HH:MM (con segundos opcionales)
-            time_m = re.search(r'\b(\d{1,2}):(\d{2})(?::\d{2})?\b', line)
-            if not time_m:
+            if len(line) < 10:
                 continue
-            h, mi = int(time_m.group(1)), int(time_m.group(2))
-            if h > 23 or mi > 59:
+
+            hora, time_end = _find_time(line)
+            if hora is None:
                 continue
-            hora = f"{h:02d}:{mi:02d}"
 
-            # Dividir la línea por cualquier separador de celda: | [ ] { }
-            tokens = re.split(r'[|\[\]{}]', line)
-            tokens = [t.strip() for t in tokens if t.strip()]
-
-            # Buscar fecha: primer token que normalice como fecha válida
+            # Buscar fecha en la línea completa
             fecha = None
-            for tok in tokens:
+            for tok in re.split(r'[|\[\]{}]', line):
+                tok = tok.strip()
+                if not tok:
+                    continue
                 c = _num_clean_token(tok)
                 fecha = _normalize_date_token(c, reference_year=ref_year)
                 if fecha:
                     break
-            # Si no se encontró fecha como token, buscar en texto completo de la línea
             if not fecha:
                 fecha = _normalize_date_token(_num_clean_token(line), reference_year=ref_year)
 
-            # Encontrar índice del token con la hora
-            time_idx = None
-            for i, tok in enumerate(tokens):
-                if re.search(r'\d{1,2}:\d{2}', tok):
-                    time_idx = i
-                    break
-
-            # Extraer números de los tokens POST-hora, usando _num_clean_token
-            post_tokens = tokens[time_idx + 1:] if time_idx is not None else tokens
+            # Extraer números de los tokens POST-hora
+            # Para tokens cortos (≤5 chars) se aplican sustituciones ZLogic agresivas
+            # (i→1, a→4) sin afectar palabras largas como "Automatica"/"Repeticion".
+            post_line = line[time_end:]
             nums = []
-            for tok in post_tokens[:10]:
+            for tok in re.split(r'[|\[\]{}\s]+', post_line)[:12]:
+                if not tok:
+                    continue
                 c = _num_clean_token(tok)
+                # Sustituciones extra sólo para tokens cortos (valor numérico con OCR)
+                if len(tok.strip()) <= 5:
+                    c2 = tok.strip()
+                    c2 = c2.replace("i","1").replace("a","4")
+                    c2 = c2.replace("l","1").replace("I","1")
+                    c2 = c2.replace("o","0").replace("O","0")
+                    c2 = c2.replace("s","5").replace("S","5")
+                    c2 = c2.replace("z","2").replace("G","6")
+                    c2 = re.sub(r"[^0-9]", "", c2)
+                    if len(c2) > len(re.sub(r"[^0-9]", "", c)):
+                        c = c2
                 for m2 in re.finditer(r'\d{2,3}', c):
                     v = int(m2.group())
                     if 20 <= v <= 260:
@@ -1090,10 +1144,12 @@ def _parse_zlogic_table(text):
                 continue
 
             # Buscar par PAS/PAD plausible
+            # Umbral inferior: 60 para PAS (lecturas nocturnas pueden ser 65-79)
+            # y 30 para PAD (clean_data filtra después con PAD_min=40)
             best = None
             for i in range(len(nums) - 1):
                 pas, pad = nums[i], nums[i + 1]
-                if 80 <= pas <= 220 and 40 <= pad <= 130 and pas > pad + 10:
+                if 60 <= pas <= 220 and 30 <= pad <= 130 and pas > pad + 10:
                     fc  = nums[i+2] if i+2 < len(nums) and 30 <= nums[i+2] <= 180 else np.nan
                     pam = nums[i+3] if i+3 < len(nums) else round(pad + (pas - pad) / 3)
                     pp  = nums[i+4] if i+4 < len(nums) else pas - pad
