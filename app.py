@@ -254,15 +254,27 @@ def parse_mapa_pdf(pdf_file):
         if df_tbl is not None and len(df_tbl) > (len(df) if df is not None else 0):
             df = df_tbl
 
-    # 5) Último recurso: parser agresivo, solo si parece PDF original y no informe final generado
+    # 5) Parser agresivo de texto
     if (df is None or len(df) < 20) and ("resultados – promedios" not in full_text.lower()):
         df2 = _parse_from_text_v2(full_text)
         if df2 is not None and len(df2) > (len(df) if df is not None else 0):
             df = df2
 
+    # 6) _parse_fixed_width – columnas de ancho fijo (faltaba en el pipeline)
+    if df is None or len(df) < 20:
+        df_fw = _parse_fixed_width(full_text)
+        if df_fw is not None and len(df_fw) > (len(df) if df is not None else 0):
+            df = df_fw
+
+    # 7) Último recurso: extracción numérica pura, tolera OCR muy ruidoso
+    if df is None or len(df) < 10:
+        df_np = _parse_numeric_pairs(full_text)
+        if df_np is not None and len(df_np) > (len(df) if df is not None else 0):
+            df = df_np
+
     meta = _extract_meta(full_text)
 
-    if df is None or len(df) < 20:
+    if df is None or len(df) < 10:
         msg = (
             "No se pudo importar una TABLA COMPLETA válida desde el PDF original. "
             "El archivo parece no contener lecturas crudas suficientes, o se cargó un informe ya generado "
@@ -282,12 +294,12 @@ def parse_mapa_pdf(pdf_file):
     return df, meta, full_text
 
 
-def _ocr_pdf_pages(pdf_file, dpi=220):
+def _ocr_pdf_pages(pdf_file, dpi=300):
     """OCR de todas las páginas del PDF con PyMuPDF + Tesseract."""
     try:
         import fitz
         import pytesseract
-        from PIL import Image, ImageOps, ImageFilter
+        from PIL import Image, ImageOps, ImageFilter, ImageEnhance
     except Exception as e:
         raise RuntimeError(
             "Faltan dependencias OCR. En requirements.txt deben estar pymupdf, pillow y pytesseract; "
@@ -304,15 +316,27 @@ def _ocr_pdf_pages(pdf_file, dpi=220):
     for i, page in enumerate(doc):
         pix = page.get_pixmap(matrix=mat, alpha=False)
         img = Image.open(io.BytesIO(pix.tobytes("png"))).convert("L")
-        img = ImageOps.autocontrast(img)
-        # Leve enfoque; evita destruir texto pequeño de tabla.
-        img = img.filter(ImageFilter.SHARPEN)
-        config = "--oem 3 --psm 6"
-        try:
-            txt = pytesseract.image_to_string(img, lang="spa+eng", config=config)
-        except Exception:
-            txt = pytesseract.image_to_string(img, lang="eng", config=config)
-        texts.append(f"\n--- OCR_PAGE_{i+1} ---\n{txt}")
+        img = ImageOps.autocontrast(img, cutoff=2)
+        # Mejorar contraste y nitidez para tablas escaneadas.
+        img = ImageEnhance.Sharpness(img).enhance(2.0)
+        img = ImageEnhance.Contrast(img).enhance(1.5)
+        # Probar PSM 6/4/11; elegir el que extraiga más dígitos.
+        best_txt = ""
+        best_score = -1
+        for psm in [6, 4, 11]:
+            config = f"--oem 3 --psm {psm}"
+            try:
+                try:
+                    txt = pytesseract.image_to_string(img, lang="spa+eng", config=config)
+                except Exception:
+                    txt = pytesseract.image_to_string(img, lang="eng", config=config)
+                score = len(re.findall(r'\d', txt))
+                if score > best_score:
+                    best_score = score
+                    best_txt = txt
+            except Exception:
+                pass
+        texts.append(f"\n--- OCR_PAGE_{i+1} ---\n{best_txt}")
 
     return "\n".join(texts)
 
@@ -612,7 +636,7 @@ def _ocr_medicaldb_table_layout(pdf_file, dpi=260):
                 parsed["nro"] = len(all_rows) + len(page_rows) + 1
                 page_rows.append(parsed)
 
-        if len(page_rows) >= 3:
+        if len(page_rows) >= 2:
             all_rows.extend(page_rows)
 
     if not all_rows:
@@ -622,8 +646,7 @@ def _ocr_medicaldb_table_layout(pdf_file, dpi=260):
     for c in ["PAS","PAD","FC","PAM","PP"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
     df = df.dropna(subset=["PAS","PAD"])
-    return df if len(df) >= 20 else None
-
+    return df if len(df) >= 10 else None
 
 
 def _extract_ints_after(text):
@@ -722,7 +745,7 @@ def _parse_medicaldb_table_text(text):
                     "motivo": rest.strip()
                 })
 
-    if len(rows) < 20:
+    if len(rows) < 10:
         # Parser línea por línea, menos estricto, para OCR con filas intactas.
         for line in text.splitlines():
             if not re.search(r"\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}|\d{6,8}", line):
@@ -764,8 +787,7 @@ def _parse_medicaldb_table_text(text):
     for c in ["PAS","PAD","FC","PAM","PP"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
     df = df.dropna(subset=["PAS","PAD"])
-    return df if len(df) >= 20 else None
-
+    return df if len(df) >= 10 else None
 
 def _ensure_datetime_sequence(df, meta=None):
     df = df.copy()
@@ -935,6 +957,39 @@ def _parse_from_text_v2_old(text):
     if len(readings) > 5:
         return pd.DataFrame(readings)
     return None
+
+
+def _parse_numeric_pairs(text):
+    """
+    Parser de último recurso para texto OCR con formato irregular.
+    Busca hora hh:mm + par numérico PAS/PAD plausible en cada línea.
+    No requiere fechas ni estructura de tabla; tolera OCR muy ruidoso.
+    """
+    readings = []
+    for line in text.splitlines():
+        hora_m = re.search(r'\b(\d{1,2}):(\d{2})\b', line)
+        if not hora_m:
+            continue
+        h, mi = int(hora_m.group(1)), int(hora_m.group(2))
+        if h > 23 or mi > 59:
+            continue
+        hora = f"{h:02d}:{mi:02d}"
+        nums = [int(n) for n in re.findall(r'\b(\d{2,3})\b', line)
+                if 30 <= int(n) <= 260]
+        for i in range(len(nums) - 1):
+            pas, pad = nums[i], nums[i + 1]
+            if 80 <= pas <= 220 and 40 <= pad <= 130 and pas > pad + 10:
+                r = {'hora': hora, 'PAS': pas, 'PAD': pad}
+                if i + 2 < len(nums) and 30 <= nums[i + 2] <= 180:
+                    r['FC'] = nums[i + 2]
+                readings.append(r)
+                break
+    if len(readings) < 5:
+        return None
+    df = pd.DataFrame(readings)
+    df = df.drop_duplicates(subset=['hora', 'PAS', 'PAD'], keep='first')
+    df = df[df['PAS'].between(80, 220) & df['PAD'].between(40, 130)]
+    return df if len(df) >= 5 else None
 
 
 def _extract_meta(text):
