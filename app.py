@@ -1982,64 +1982,80 @@ def classify_phenotype(m):
 
 def generate_chart(df, m):
     """
-    Gráfico canónico ÚNICO del informe:
-    - Usa exactamente el MISMO df depurado que se usa para calcular métricas.
-    - No reparsea PDF ni toma datos de promedios.
-    - No ordena por hora del día: respeta tplot/dt para conservar el cruce de medianoche.
-    - Grafica sólo PAS y PAD, como exige el formato institucional.
-    """
-    df = df.copy()
-    if 'tplot' not in df.columns:
-        df = _ensure_datetime_sequence(df, {})
-    df = df.sort_values('tplot').reset_index(drop=True)
+    Gráfico canónico ÚNICO del informe.
 
-    # Control defensivo: no graficar tablas sospechosamente incompletas.
+    CORRECCIÓN v67:
+    - El eje X usa el número secuencial de medición depurada, NO una escala continua de horas.
+      Esto evita que, en registros con saltos horarios o lecturas excluidas, el período nocturno
+      parezca "sin registros" por compresión/espacios vacíos.
+    - La franja nocturna se dibuja sobre los índices reales de las mediciones nocturnas.
+    - Se grafican todos los puntos PAS/PAD presentes en df_clean, el mismo DataFrame usado
+      para cálculos, tabla y conclusiones.
+    - Se agregan contadores visibles de lecturas diurnas/nocturnas y huella de dataset.
+    """
+    df = _prepare_df_for_chart(df)
+
     if len(df) < 20:
         raise ValueError("Tabla insuficiente para graficar: se requieren al menos 20 lecturas depuradas.")
 
+    n_noc = int((df['Período'] == 'Nocturno').sum())
+    n_dia = int((df['Período'] == 'Diurno').sum())
+    if n_noc == 0:
+        raise ValueError(
+            "No hay lecturas clasificadas como nocturnas en la tabla depurada. "
+            "Revisar asignación de período nocturno u OCR de la Tabla Completa."
+        )
+
     thr = m.get('thresholds', THRESHOLDS)
-    xs = df['tplot'].astype(float).to_numpy()
+    x = np.arange(len(df), dtype=float)
 
-    fig, ax = plt.subplots(1, 1, figsize=(14, 5.6), dpi=130)
+    fig, ax = plt.subplots(1, 1, figsize=(14, 5.8), dpi=130)
 
-    # Franja nocturna azul como banda vertical sobre el período nocturno.
-    segs = _noc_segments_plot(df)
-    for s, e in segs:
-        if e > s:
-            ax.axvspan(s, e, alpha=0.18, color='#4472C4', zorder=0)
+    # Franja nocturna por índices reales, no por horas continuas.
+    for s, e in _noc_segments_index(df):
+        ax.axvspan(s - 0.45, e + 0.45, alpha=0.18, color='#4472C4', zorder=0)
 
-    # Curvas PAS/PAD
-    ax.plot(xs, df['PAS'], color='#1f77b4', lw=1.8, marker='o', ms=4, label='PAS', zorder=3)
-    ax.plot(xs, df['PAD'], color='#ff7f0e', lw=1.8, marker='o', ms=4, label='PAD', zorder=3)
+    # Curvas PAS/PAD. Se usa marker para que cada registro sea visible.
+    ax.plot(x, df['PAS'].astype(float), color='#1f77b4', lw=1.7, marker='o', ms=4.2,
+            label='PAS', zorder=3)
+    ax.plot(x, df['PAD'].astype(float), color='#ff7f0e', lw=1.7, marker='o', ms=4.2,
+            label='PAD', zorder=3)
 
-    # Umbrales segmentados según período real
+    # Umbrales por período, calculados punto a punto sobre las mismas filas.
     periods = df['Período'].astype(str).to_numpy()
-    sys_thr = np.array([thr['nocturno']['sys'] if p == 'Nocturno' else thr['diurno']['sys'] for p in periods])
-    dia_thr = np.array([thr['nocturno']['dia'] if p == 'Nocturno' else thr['diurno']['dia'] for p in periods])
-    ax.step(xs, sys_thr, where='mid', color='#1f77b4', ls='--', lw=1.2, alpha=0.9, label='Límite PAS según período')
-    ax.step(xs, dia_thr, where='mid', color='#ff7f0e', ls=':', lw=1.3, alpha=0.9, label='Límite PAD según período')
+    sys_thr = np.array([thr['nocturno']['sys'] if p == 'Nocturno' else thr['diurno']['sys'] for p in periods], dtype=float)
+    dia_thr = np.array([thr['nocturno']['dia'] if p == 'Nocturno' else thr['diurno']['dia'] for p in periods], dtype=float)
+    ax.step(x, sys_thr, where='mid', color='#1f77b4', ls='--', lw=1.15, alpha=0.9,
+            label='Límite PAS según período')
+    ax.step(x, dia_thr, where='mid', color='#ff7f0e', ls=':', lw=1.25, alpha=0.9,
+            label='Límite PAD según período')
 
     noc_patch = mpatches.Patch(color='#4472C4', alpha=0.25, label='Período nocturno')
     handles, labels = ax.get_legend_handles_labels()
-    ax.legend(handles+[noc_patch], labels+['Período nocturno'], loc='best', fontsize=8, ncol=3, framealpha=0.9)
+    ax.legend(handles + [noc_patch], labels + ['Período nocturno'],
+              loc='best', fontsize=8, ncol=3, framealpha=0.9)
 
     ax.set_title('MAPA: mediciones validadas de presión arterial', fontsize=12, fontweight='bold')
     ax.set_ylabel('mmHg', fontsize=10)
-    ax.set_xlabel('Hora', fontsize=10)
+    ax.set_xlabel('Hora de medición', fontsize=10)
 
     ymin = max(30, min(float(df['PAD'].min()) - 12, 45))
     ymax = min(250, max(float(df['PAS'].max()) + 18, 150))
     ax.set_ylim(ymin, ymax)
+    ax.set_xlim(-0.8, len(df) - 0.2)
     ax.grid(True, alpha=0.28)
 
-    _fmt_x(ax, df)
+    _fmt_x_index(ax, df)
 
-    # Huella de datos mínima para trazabilidad interna en el PNG.
-    # Ayuda a detectar si se está graficando otro set de lecturas.
+    # Trazabilidad: número de registros de cada período y huella del dataset graficado.
     try:
         fp = _dataset_fingerprint(df)
-        ax.text(0.995, 0.01, f"n={len(df)} · ID {fp[:8]}", transform=ax.transAxes,
-                ha='right', va='bottom', fontsize=6, color='#666666')
+        ax.text(
+            0.995, 0.01,
+            f"n={len(df)} · Diurno={n_dia} · Nocturno={n_noc} · ID {fp[:8]}",
+            transform=ax.transAxes, ha='right', va='bottom',
+            fontsize=6.5, color='#666666'
+        )
     except Exception:
         pass
 
@@ -2052,20 +2068,94 @@ def generate_chart(df, m):
     return buf
 
 
+def _prepare_df_for_chart(df):
+    """
+    Devuelve un DataFrame ordenado cronológicamente y con períodos consistentes.
+    No descarta filas; sólo normaliza columnas necesarias para el gráfico.
+    """
+    out = df.copy()
+
+    # Asegurar hora legible.
+    if 'hora' not in out.columns:
+        raise ValueError("La tabla depurada no contiene columna hora para graficar.")
+    out['hora'] = out['hora'].astype(str).str.slice(0, 5)
+
+    # Si no hay fecha o dt/tplot, reconstruir secuencia cronológica.
+    if 'tplot' not in out.columns or out['tplot'].isna().all():
+        out = _ensure_datetime_sequence(out, {})
+    else:
+        out = out.sort_values('tplot').reset_index(drop=True)
+
+    # Normalizar período: si falta, se calcula por horario estándar 23:00–07:00.
+    def _period_from_time_for_chart(h):
+        mins = time_to_minutes(h)
+        if mins is None:
+            return 'Diurno'
+        hr = mins // 60
+        return 'Nocturno' if (hr >= 23 or hr < 7) else 'Diurno'
+
+    if 'Período' not in out.columns:
+        out['Período'] = out['hora'].apply(_period_from_time_for_chart)
+    else:
+        per = out['Período'].astype(str).str.strip().str.lower()
+        calc = out['hora'].apply(_period_from_time_for_chart)
+        out['Período'] = np.where(
+            per.str.contains('noch|noct', regex=True), 'Nocturno',
+            np.where(per.str.contains('dia|diur', regex=True), 'Diurno', calc)
+        )
+
+    # Orden final. Si hay tplot, preserva cruce de medianoche; si no, orden original.
+    if 'tplot' in out.columns and out['tplot'].notna().any():
+        out = out.sort_values('tplot').reset_index(drop=True)
+    else:
+        out = out.reset_index(drop=True)
+
+    out['xidx'] = np.arange(len(out), dtype=float)
+    if 'hora_label' not in out.columns or out['hora_label'].isna().all():
+        out['hora_label'] = out['hora']
+
+    return out
+
+
 def _dataset_fingerprint(df):
     cols = [c for c in ['fecha','hora','PAS','PAD','FC','PAM','PP','Período'] if c in df.columns]
     tmp = df[cols].copy().fillna("")
     # Normalizar orden y formato para que el hash sea reproducible.
     if 'tplot' in df.columns:
-        tmp['_tplot'] = df['tplot'].round(2)
+        tmp['_tplot'] = pd.to_numeric(df['tplot'], errors='coerce').round(2)
     data = tmp.to_csv(index=False).encode('utf-8')
     return hashlib.sha256(data).hexdigest()
 
 
+def _noc_segments_index(df):
+    """
+    Segmentos nocturnos en coordenadas de índice de fila.
+    Devuelve pares (inicio_idx, fin_idx) inclusivos.
+    """
+    segs = []
+    in_seg = False
+    start = 0
+    for i, p in enumerate(df['Período'].astype(str).tolist()):
+        is_noc = (p == 'Nocturno')
+        if is_noc and not in_seg:
+            start = i
+            in_seg = True
+        elif not is_noc and in_seg:
+            segs.append((start, i - 1))
+            in_seg = False
+    if in_seg:
+        segs.append((start, len(df) - 1))
+    return segs
+
+
 def _noc_segments_plot(df):
+    """
+    Compatibilidad con versiones previas. Ya no se usa para graficar.
+    Mantiene el comportamiento previo por si otra parte del código lo invoca.
+    """
     segs, in_noc, start, last = [], False, None, None
     for _, row in df.iterrows():
-        x = float(row['tplot'])
+        x = float(row.get('tplot', row.name))
         if row['Período'] == 'Nocturno':
             if not in_noc:
                 start = x
@@ -2077,29 +2167,41 @@ def _noc_segments_plot(df):
                 in_noc = False
         last = x
     if in_noc and start is not None:
-        segs.append((start, float(df['tplot'].max())))
+        segs.append((start, float(df.get('tplot', pd.Series([len(df)-1])).max())))
     return segs
 
 
-def _fmt_x(ax, df):
-    if 'tplot' not in df.columns:
+def _fmt_x_index(ax, df):
+    """
+    Etiquetas del eje X sobre índice secuencial.
+    Muestra horarios reales de medición, evitando espacios vacíos artificiales.
+    """
+    n = len(df)
+    if n == 0:
         return
-    x = df['tplot'].astype(float)
-    mn, mx = float(x.min()), float(x.max())
-    if mx <= mn:
-        return
-    # ticks cada 2 h, con hora real del registro más cercana
-    step = 120
-    ticks = list(np.arange(0, mx + step, step))
+
+    # Máximo ~14 etiquetas para que no se superpongan.
+    step = max(1, int(np.ceil(n / 14)))
+    ticks = list(range(0, n, step))
+    if (n - 1) not in ticks:
+        ticks.append(n - 1)
+
     labels = []
-    for t in ticks:
-        idx = (x - t).abs().idxmin()
-        lab = str(df.loc[idx, 'hora_label'] if 'hora_label' in df.columns else df.loc[idx, 'hora'])
-        labels.append(lab[:5])
-    ax.set_xlim(mn - 10, mx + 10)
+    for i in ticks:
+        hora = str(df.loc[i, 'hora_label'] if 'hora_label' in df.columns else df.loc[i, 'hora'])[:5]
+        per = 'N' if str(df.loc[i, 'Período']) == 'Nocturno' else 'D'
+        labels.append(f"{hora}\n{per}")
+
     ax.set_xticks(ticks)
-    ax.set_xticklabels(labels, rotation=45, fontsize=7)
-    ax.set_xlabel('Hora del registro', fontsize=9)
+    ax.set_xticklabels(labels, rotation=0, fontsize=7)
+    ax.set_xlabel('Hora de medición (D=diurno, N=nocturno)', fontsize=9)
+
+
+def _fmt_x(ax, df):
+    """
+    Compatibilidad con versiones previas. Para el gráfico canónico se usa _fmt_x_index().
+    """
+    return _fmt_x_index(ax, df)
 
 class HorizontalRule(Flowable):
     def __init__(self, width, thickness=0.5, color=colors.HexColor('#1F3864')):
