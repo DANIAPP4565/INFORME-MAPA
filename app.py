@@ -186,28 +186,81 @@ def _is_generated_report(text):
     """
     Detecta si el PDF cargado parece ser un informe ya generado por esta app
     y no el PDF original del equipo MAPA.
+
+    Corrección crítica:
+    - Las versiones anteriores NO bloqueaban informes generados si el texto contenía
+      la palabra "MedicalDB" en la fuente de datos. Eso permitía reimportar un PDF
+      ya procesado y producir gráficos/promedios distintos para el mismo estudio.
+    - Un PDF original de MedicalDB puede contener "IPENSA" y "M.A.P.A.", pero NO
+      contiene la estructura editorial de esta app: "Conclusión ejecutiva",
+      "Comparación con guías", "Conclusión médica ampliada", "Ricardo Daniel Olano".
     """
     if not text:
         return False
     t = text.lower()
-    señales_app = [
-        "monitoreo ambulatorio de presión arterial (m.a.p.a.)",
+
+    señales_app_fuertes = [
         "ricardo daniel olano",
         "conclusión ejecutiva",
+        "conclusion ejecutiva",
         "conclusión médica ampliada",
+        "conclusion médica ampliada",
+        "conclusion medica ampliada",
         "comparación con guías",
+        "comparacion con guias",
+        "tabla única de promedios",
+        "tabla unica de promedios",
+        "resultados – promedios",
+        "resultados - promedios",
+        "lecturas analizadas luego de depuración",
+        "lecturas analizadas luego de depuracion",
+        "fuente de datos: pdf mapa",
+        "informe mapa – ipensa",
+        "informe mapa - ipensa",
     ]
-    señales_equipo = [
-        "medicaldb",
+    score_app = sum(s in t for s in señales_app_fuertes)
+
+    # Marcadores de PDF original MedicalDB/ZLogic. Se usan sólo para diagnóstico,
+    # no para anular la detección de informe generado.
+    señales_original_equipo = [
         "tabla completa",
         "promedios horarios",
         "representación gráfica de presiones",
-        "graficas de distribuciones",
+        "representacion grafica de presiones",
         "gráficas de distribuciones",
+        "graficas de distribuciones",
+        "medicaldb 17.7",
+        "total de mediciones válidas",
+        "total de mediciones validas",
     ]
-    score_app = sum(s in t for s in señales_app)
-    score_equipo = sum(s in t for s in señales_equipo)
-    return score_app >= 2 and score_equipo == 0
+    score_equipo = sum(s in t for s in señales_original_equipo)
+
+    # Informe generado: basta con dos señales fuertes de app, aunque diga MedicalDB.
+    if score_app >= 2:
+        return True
+
+    # También bloquear si aparecen secciones inequívocas de informe ya procesado.
+    if ("resultados" in t and "promedios" in t and "aasi" in t and "cargas tensionales" in t):
+        return True
+
+    return False
+
+
+def _generated_report_error(full_text):
+    pac = "no identificado"
+    try:
+        if "Paciente:" in full_text:
+            pac = full_text.split("Paciente:", 1)[1].split("\n", 1)[0].strip()
+            pac = re.sub(r"\s+", " ", pac)
+    except Exception:
+        pass
+    return (
+        "⚠️ El PDF cargado es un INFORME YA GENERADO por la app, no el PDF original del equipo MAPA. "
+        "No se reimportan informes procesados porque se mezclan promedios, texto y gráficos, y eso genera "
+        "curvas diferentes para el mismo estudio. Suba únicamente el PDF ORIGINAL del equipo MedicalDB/ZLogic "
+        "que contiene las páginas 'Tabla Completa' con las lecturas individuales. "
+        f"Paciente detectado: {pac}"
+    )
 
 
 @st.cache_data(show_spinner=False, ttl=3600, max_entries=8)
@@ -271,6 +324,14 @@ def parse_mapa_pdf(pdf_file):
         meta_ocr_text = ""
 
     full_text_pre = "\n".join([raw_text, meta_ocr_text]).strip()
+
+    # BLOQUEO CRÍTICO: nunca reprocesar un informe generado por la app.
+    # Este fue el origen de gráficos distintos para el mismo estudio: se subía un
+    # PDF ya procesado, el parser leía texto de promedios/figuras y construía una
+    # tabla parcial o reordenada.
+    if _is_generated_report(full_text_pre):
+        return None, _generated_report_error(full_text_pre), full_text_pre
+
     meta = _extract_meta(full_text_pre)
 
     # 3) Tabla completa por grilla OCR, antes de OCR completo.
@@ -305,6 +366,9 @@ def parse_mapa_pdf(pdf_file):
             ocr_text = ""
 
     full_text = "\n".join([raw_text, meta_ocr_text, ocr_text]).strip()
+    if _is_generated_report(full_text):
+        return None, _generated_report_error(full_text), full_text
+
     meta2 = _extract_meta(full_text)
     # Fusionar metadatos: lo nuevo no pisa datos válidos previos salvo que falten.
     for k, v in meta2.items():
@@ -350,13 +414,7 @@ def parse_mapa_pdf(pdf_file):
 
     if df is None or len(df) < 10:
         if _is_generated_report(full_text):
-            pac = full_text.split("Paciente:")[1].split("\n")[0].strip() if "Paciente:" in full_text else "no identificado"
-            msg = (
-                "⚠️ El PDF cargado es un INFORME YA GENERADO por esta app, no el PDF original del equipo MAPA. "
-                "Para procesar un nuevo informe, suba el PDF ORIGINAL del equipo MedicalDB 17.7 "
-                "(el que contiene la Tabla Completa con las lecturas individuales de presión arterial). "
-                f"Paciente detectado en el informe: {pac}"
-            )
+            msg = _generated_report_error(full_text)
         else:
             msg = (
                 "No se pudo importar una TABLA COMPLETA válida desde el PDF original. "
@@ -1923,69 +1981,85 @@ def classify_phenotype(m):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def generate_chart(df, m):
+    """
+    Gráfico canónico ÚNICO del informe:
+    - Usa exactamente el MISMO df depurado que se usa para calcular métricas.
+    - No reparsea PDF ni toma datos de promedios.
+    - No ordena por hora del día: respeta tplot/dt para conservar el cruce de medianoche.
+    - Grafica sólo PAS y PAD, como exige el formato institucional.
+    """
     df = df.copy()
-    # Eje X cronológico real: NO ordenar por hora del día porque rompe el cruce de medianoche.
     if 'tplot' not in df.columns:
         df = _ensure_datetime_sequence(df, {})
     df = df.sort_values('tplot').reset_index(drop=True)
 
-    thr = m['thresholds']
-    fig, axes = plt.subplots(2, 1, figsize=(14, 8), dpi=110,
-                              gridspec_kw={'hspace': 0.42})
+    # Control defensivo: no graficar tablas sospechosamente incompletas.
+    if len(df) < 20:
+        raise ValueError("Tabla insuficiente para graficar: se requieren al menos 20 lecturas depuradas.")
 
-    # Franja nocturna azul real por segmentos cronológicos
-    segs = _noc_segments_plot(df)
-    for ax in axes:
-        for s, e in segs:
-            ax.axvspan(s, e, alpha=0.14, color='#4472C4', zorder=0)
-
-    # Umbrales por período como líneas escalonadas/segmentadas
+    thr = m.get('thresholds', THRESHOLDS)
     xs = df['tplot'].astype(float).to_numpy()
+
+    fig, ax = plt.subplots(1, 1, figsize=(14, 5.6), dpi=130)
+
+    # Franja nocturna azul como banda vertical sobre el período nocturno.
+    segs = _noc_segments_plot(df)
+    for s, e in segs:
+        if e > s:
+            ax.axvspan(s, e, alpha=0.18, color='#4472C4', zorder=0)
+
+    # Curvas PAS/PAD
+    ax.plot(xs, df['PAS'], color='#1f77b4', lw=1.8, marker='o', ms=4, label='PAS', zorder=3)
+    ax.plot(xs, df['PAD'], color='#ff7f0e', lw=1.8, marker='o', ms=4, label='PAD', zorder=3)
+
+    # Umbrales segmentados según período real
     periods = df['Período'].astype(str).to_numpy()
     sys_thr = np.array([thr['nocturno']['sys'] if p == 'Nocturno' else thr['diurno']['sys'] for p in periods])
     dia_thr = np.array([thr['nocturno']['dia'] if p == 'Nocturno' else thr['diurno']['dia'] for p in periods])
-
-    ax = axes[0]
-    ax.plot(xs, df['PAS'], color='#C00000', lw=1.8, marker='o', ms=3, label='PAS', zorder=3)
-    ax.plot(xs, df['PAD'], color='#0070C0', lw=1.8, marker='s', ms=3, label='PAD', zorder=3)
-    ax.step(xs, sys_thr, where='mid', color='#C00000', ls='--', lw=1.1, alpha=0.75,
-            label='Umbral sistólico según período')
-    ax.step(xs, dia_thr, where='mid', color='#0070C0', ls='--', lw=1.1, alpha=0.75,
-            label='Umbral diastólico según período')
+    ax.step(xs, sys_thr, where='mid', color='#1f77b4', ls='--', lw=1.2, alpha=0.9, label='Límite PAS según período')
+    ax.step(xs, dia_thr, where='mid', color='#ff7f0e', ls=':', lw=1.3, alpha=0.9, label='Límite PAD según período')
 
     noc_patch = mpatches.Patch(color='#4472C4', alpha=0.25, label='Período nocturno')
     handles, labels = ax.get_legend_handles_labels()
-    ax.legend(handles+[noc_patch], labels+['Período nocturno'], loc='upper right',
-              fontsize=7, ncol=3, framealpha=0.85)
-    ax.set_ylabel('Presión arterial (mmHg)', fontsize=9)
-    ax.set_title('Monitoreo Ambulatorio de Presión Arterial – lecturas válidas depuradas', fontsize=11, fontweight='bold')
-    ymin = max(30, min(df['PAD'].min() - 15, 50))
-    ymax = min(250, max(df['PAS'].max() + 20, 170))
+    ax.legend(handles+[noc_patch], labels+['Período nocturno'], loc='best', fontsize=8, ncol=3, framealpha=0.9)
+
+    ax.set_title('MAPA: mediciones validadas de presión arterial', fontsize=12, fontweight='bold')
+    ax.set_ylabel('mmHg', fontsize=10)
+    ax.set_xlabel('Hora', fontsize=10)
+
+    ymin = max(30, min(float(df['PAD'].min()) - 12, 45))
+    ymax = min(250, max(float(df['PAS'].max()) + 18, 150))
     ax.set_ylim(ymin, ymax)
     ax.grid(True, alpha=0.28)
+
     _fmt_x(ax, df)
 
-    ax2 = axes[1]
-    if 'FC' in df.columns and not df['FC'].isna().all():
-        ax2.plot(xs, df['FC'], color='#00A651', lw=1.8, marker='^', ms=3, label='FC (lpm)', zorder=3)
-        ax2.set_ylabel('Frecuencia cardíaca (lpm)', fontsize=9)
-        ax2.set_title('Frecuencia cardíaca – 24 h', fontsize=11, fontweight='bold')
-        ax2.legend(loc='upper right', fontsize=8)
-        ymin2 = max(25, min(df['FC'].dropna().min() - 15, 40))
-        ymax2 = min(180, max(df['FC'].dropna().max() + 20, 120))
-        ax2.set_ylim(ymin2, ymax2)
-        ax2.grid(True, alpha=0.28)
-        _fmt_x(ax2, df)
-    else:
-        ax2.text(0.5, 0.5, 'Frecuencia cardíaca no disponible', ha='center', va='center', transform=ax2.transAxes)
-        ax2.set_axis_off()
+    # Huella de datos mínima para trazabilidad interna en el PNG.
+    # Ayuda a detectar si se está graficando otro set de lecturas.
+    try:
+        fp = _dataset_fingerprint(df)
+        ax.text(0.995, 0.01, f"n={len(df)} · ID {fp[:8]}", transform=ax.transAxes,
+                ha='right', va='bottom', fontsize=6, color='#666666')
+    except Exception:
+        pass
 
     fig.patch.set_facecolor('white')
+    fig.tight_layout()
     buf = io.BytesIO()
-    fig.savefig(buf, format='PNG', dpi=110)
+    fig.savefig(buf, format='PNG', dpi=130)
     buf.seek(0)
     plt.close(fig)
     return buf
+
+
+def _dataset_fingerprint(df):
+    cols = [c for c in ['fecha','hora','PAS','PAD','FC','PAM','PP','Período'] if c in df.columns]
+    tmp = df[cols].copy().fillna("")
+    # Normalizar orden y formato para que el hash sea reproducible.
+    if 'tplot' in df.columns:
+        tmp['_tplot'] = df['tplot'].round(2)
+    data = tmp.to_csv(index=False).encode('utf-8')
+    return hashlib.sha256(data).hexdigest()
 
 
 def _noc_segments_plot(df):
@@ -2094,6 +2168,47 @@ def _page_template(canv, doc):
     canv.drawRightString(PAGE_W - MAR_R, 12*mm, f"Página {doc.page}")
     canv.restoreState()
 
+
+def _draw_signature_stamp_page1(canv, firma_bytes):
+    """
+    Dibuja SIEMPRE firma y sello en la hoja 1, en posición fija inferior derecha.
+
+    Motivo de esta implementación:
+    - Cuando la firma se agrega como Flowable al story, ReportLab puede desplazarla
+      a página 2 si la página 1 queda cargada.
+    - Al dibujarla sobre el canvas de onFirstPage queda anclada a la hoja 1.
+    - Se usa preserveAspectRatio para evitar deformación y se deja por encima del footer.
+    """
+    canv.saveState()
+    try:
+        x = PAGE_W - MAR_R - 4.8*cm
+        y = 2.05*cm
+        w = 4.8*cm
+        h = 2.6*cm
+
+        if firma_bytes:
+            from reportlab.lib.utils import ImageReader
+            img = ImageReader(io.BytesIO(firma_bytes))
+            canv.drawImage(img, x, y, width=w, height=h,
+                           preserveAspectRatio=True, mask='auto',
+                           anchor='se')
+        else:
+            canv.setFont('Helvetica-Bold', 8)
+            canv.setFillColor(colors.black)
+            canv.drawRightString(PAGE_W - MAR_R, y + 1.25*cm, f"Dr. {DOCTOR_NAME}")
+            canv.setFont('Helvetica', 7)
+            canv.drawRightString(PAGE_W - MAR_R, y + 0.9*cm, DOCTOR_TITLE)
+            canv.drawRightString(PAGE_W - MAR_R, y + 0.55*cm, DOCTOR_MP)
+
+        canv.setFont('Helvetica', 8)
+        canv.setFillColor(colors.black)
+        canv.drawRightString(PAGE_W - MAR_R, y - 0.15*cm, f"Dr. {DOCTOR_NAME}")
+        canv.setFont('Helvetica', 7)
+        canv.drawRightString(PAGE_W - MAR_R, y - 0.50*cm,
+                              "Cardiólogo Especialista en Hipertensión Arterial y Mecánica Vascular")
+    finally:
+        canv.restoreState()
+
 def generate_pdf(df, m, pat, stu, phenotype, logo_bytes, firma_bytes, excluded):
     buf = io.BytesIO()
     doc = SimpleDocTemplate(buf, pagesize=A4,
@@ -2111,7 +2226,11 @@ def generate_pdf(df, m, pat, stu, phenotype, logo_bytes, firma_bytes, excluded):
     # ── PAGE 2+ ─────────────────────────────────────────────────────────────
     story += _page2plus(df, m, pat, phenotype, s)
 
-    doc.build(story, onFirstPage=_page_template, onLaterPages=_page_template)
+    def _first_page_template(canv, doc):
+        _page_template(canv, doc)
+        _draw_signature_stamp_page1(canv, firma_bytes)
+
+    doc.build(story, onFirstPage=_first_page_template, onLaterPages=_page_template)
     buf.seek(0)
     return buf
 
@@ -2336,20 +2455,11 @@ def _page1(m, pat, stu, phenotype, logo_bytes, firma_bytes, excluded, s):
         s['body']))
     story.append(Spacer(1, 8))
 
-    # ─ Firma ─
-    if firma_bytes:
-        firma_img = RLImage(io.BytesIO(firma_bytes), width=5*cm, height=3*cm,
-                            kind='proportional')
-        firma_tbl = Table([[firma_img]], colWidths=[CONTENT_W],
-                          style=TableStyle([('ALIGN',(0,0),(-1,-1),'RIGHT'),
-                                            ('RIGHTPADDING',(0,0),(-1,-1),0)]))
-        story.append(firma_tbl)
-    else:
-        story.append(Spacer(1, 28))
-        story.append(Paragraph(
-            f"<b>Dr. {DOCTOR_NAME}</b><br/>{DOCTOR_TITLE}<br/>"
-            f"Especialista Universitario en Cardiología<br/>{DOCTOR_MP}",
-            ParagraphStyle('firma', fontName='Helvetica', fontSize=9, alignment=TA_RIGHT)))
+    # ─ Firma y sello ─
+    # Se dibujan de forma fija en onFirstPage mediante _draw_signature_stamp_page1().
+    # No se agregan como Flowable al story para evitar que ReportLab los desplace a página 2.
+    # Se deja un pequeño espacio de seguridad al final del bloque de texto.
+    story.append(Spacer(1, 2))
 
     return story
 
@@ -2658,7 +2768,7 @@ def main():
     if st.session_state.get("parse_error"):
         meta_or_err = st.session_state.get("parse_error")
         raw_text_debug = st.session_state.get("raw_text_debug", "")
-        is_gen = "⚠️ El PDF cargado es un INFORME YA GENERADO" in str(meta_or_err)
+        is_gen = "INFORME YA GENERADO" in str(meta_or_err)
         if is_gen:
             st.warning(meta_or_err)
             st.info(
@@ -2835,6 +2945,7 @@ def main():
                 "pas_night": f"{safe(m.get('PAS_nocturno'), '1')}/{safe(m.get('PAD_nocturno'), '1')} mmHg",
                 "used": f"{len(df_clean)} / {n_orig}",
                 "excluded": excluded,
+                "fingerprint": _dataset_fingerprint(df_clean),
             }
 
     # Mostrar resultado persistente tras generar.
