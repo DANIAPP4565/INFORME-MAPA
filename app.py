@@ -1506,7 +1506,7 @@ def generate_chart(df, m):
     df = df.sort_values('tplot').reset_index(drop=True)
 
     thr = m['thresholds']
-    fig, axes = plt.subplots(2, 1, figsize=(15, 8.6), dpi=160,
+    fig, axes = plt.subplots(2, 1, figsize=(14, 8), dpi=110,
                               gridspec_kw={'hspace': 0.42})
 
     # Franja nocturna azul real por segmentos cronológicos
@@ -1558,7 +1558,7 @@ def generate_chart(df, m):
 
     fig.patch.set_facecolor('white')
     buf = io.BytesIO()
-    fig.savefig(buf, format='PNG', dpi=160, bbox_inches='tight')
+    fig.savefig(buf, format='PNG', dpi=110)
     buf.seek(0)
     plt.close(fig)
     return buf
@@ -2234,7 +2234,7 @@ def main():
     if edad_val < 0 or edad_val > 120:
         edad_val = 50
     sexo = meta.get("sexo", "No especificado")
-    obra_social = meta.get("obra_social", "NO ESPECIFICADA")
+    obra_social = meta.get("obra_social", "")
     solicitante = meta.get("solicitante", "–")
     motivo = meta.get("motivo", "–")
     fecha_estudio = meta.get("fecha_inicio", datetime.now().strftime("%d/%m/%Y"))
@@ -2260,9 +2260,12 @@ def main():
     with st.expander("Vista previa de lecturas importadas", expanded=False):
         st.dataframe(df_raw, use_container_width=True)
 
-    # Permitir sólo corrección puntual opcional, sin carga manual de lecturas.
-    with st.expander("Corrección opcional de filiatorios importados", expanded=False):
-        st.caption("No es carga manual de lecturas; sólo permite corregir un dato filiatorio si el OCR lo leyó con error.")
+    # Permitir corrección de filiatorios; se expande automáticamente si faltan datos clave.
+    _faltan_datos = (sexo == "No especificado" or not obra_social.strip())
+    if _faltan_datos:
+        st.warning("⚠️ Sexo y/u obra social no figuran en el PDF — completar manualmente antes de generar.")
+    with st.expander("Completar / corregir datos del paciente", expanded=_faltan_datos):
+        st.caption("Corrija cualquier campo que el OCR haya leído con error o que esté en blanco en el PDF del dispositivo.")
         nombre = st.text_input("Nombre y apellido", value=nombre)
         cc1, cc2, cc3 = st.columns(3)
         try:
