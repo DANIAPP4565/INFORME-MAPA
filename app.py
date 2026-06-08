@@ -2533,7 +2533,20 @@ def _page1(m, pat, stu, phenotype, logo_bytes, firma_bytes, excluded, s):
         s['small']))
     story.append(Spacer(1, 8))
 
-    # Variability
+    # La sección VARIABILIDAD se trasladó a la segunda hoja para dejar
+    # la firma y sello siempre limpios en la primera hoja.
+
+    # ─ Firma y sello ─
+    # Se dibujan de forma fija en onFirstPage mediante _draw_signature_stamp_page1().
+    # No se agregan como Flowable al story para evitar que ReportLab los desplace a página 2.
+    # Se deja un pequeño espacio de seguridad al final del bloque de texto.
+    story.append(Spacer(1, 2))
+
+    return story
+
+def _variability_section(m, s):
+    """Bloque de variabilidad ubicado en hoja 2 del informe PDF."""
+    story = []
     story.append(Paragraph("VARIABILIDAD", s['heading']))
     story.append(HorizontalRule(CONTENT_W, thickness=0.5))
     story.append(Spacer(1, 3))
@@ -2556,18 +2569,14 @@ def _page1(m, pat, stu, phenotype, logo_bytes, firma_bytes, excluded, s):
         f"| Varianza^0.5 PAD: <b>{safe(m.get('PAD_var05'),'2')}</b>",
         s['body']))
     story.append(Spacer(1, 8))
-
-    # ─ Firma y sello ─
-    # Se dibujan de forma fija en onFirstPage mediante _draw_signature_stamp_page1().
-    # No se agregan como Flowable al story para evitar que ReportLab los desplace a página 2.
-    # Se deja un pequeño espacio de seguridad al final del bloque de texto.
-    story.append(Spacer(1, 2))
-
     return story
 
 # ─── PAGE 2+ ─────────────────────────────────────────────────────────────────
 def _page2plus(df, m, pat, phenotype, s):
     story = []
+
+    # Variabilidad: ahora abre la hoja 2, antes del gráfico ambulatorio.
+    story += _variability_section(m, s)
 
     # Chart
     story.append(Paragraph("REPRESENTACIÓN GRÁFICA – PRESIÓN ARTERIAL Y FC (24 H)", s['heading']))
