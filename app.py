@@ -1177,84 +1177,105 @@ def _parse_medicaldb_table_text(text):
     return df if len(df) >= 10 else None
 
 
+
+def _canonicalize_mapa_time_axis(df, anchor_time=None, base_date=None):
+    """
+    Reconstruye un eje temporal MAPA continuo y robusto (habitualmente <=24 h).
+
+    Regla clínica/operativa prioritaria:
+    - La PRIMERA MEDICIÓN es la primera fila de la tabla que contiene un horario
+      válido. Ese primer horario reportado fija t = 0 h.
+    - ``anchor_time`` (hora de inicio de carátula/formulario) se conserva sólo
+      como respaldo si la tabla no aporta ningún horario válido; nunca desplaza
+      una primera medición realmente reportada por el equipo.
+    - Se usa aritmética módulo 24 h, por lo que un cruce de medianoche produce
+      14:15 -> 23:45 -> 00:15 -> 07:45 sin sumar días espurios.
+    - El orden OCR puede venir mezclado; por eso NO se agregan 24 h cada vez que
+      una fila "retrocede". Las lecturas se ordenan por tiempo transcurrido real
+      DESPUÉS de fijar el origen en el primer horario reportado.
+    """
+    out = df.copy().reset_index(drop=True)
+    if 'hora' not in out.columns or len(out) == 0:
+        return out
+
+    out['_source_order'] = np.arange(len(out), dtype=int)
+    out['hora'] = out['hora'].astype(str).str.slice(0, 5)
+    clock = out['hora'].apply(time_to_minutes)
+    valid = clock.dropna()
+    if valid.empty:
+        out['tplot'] = np.arange(len(out), dtype=float)
+        out['x_time_hours'] = out['tplot'] / 60.0
+        out['hora_label'] = out['hora']
+        return out.drop(columns=['_source_order'], errors='ignore')
+
+    # REGLA CRÍTICA: el origen temporal es SIEMPRE el primer horario válido
+    # REPORTADO en la tabla, respetando el orden fuente. No usar la hora mínima
+    # del reloj, no usar el menor ``nro`` y no anteponer la hora de carátula.
+    # Ejemplo: si la tabla comienza 14:15, luego cruza medianoche y contiene
+    # 07:45, la primera medición sigue siendo 14:15 (t=0), no 07:45.
+    first_idx = valid.index[0]
+    anchor_min = int(clock.loc[first_idx])
+
+    # ``anchor_time`` sólo es fallback defensivo; en la práctica este bloque no
+    # se ejecuta si existe al menos un horario válido en la tabla.
+    if anchor_min is None:
+        anchor_min = time_to_minutes(anchor_time) if anchor_time else None
+    if anchor_min is None:
+        anchor_min = 0
+
+    elapsed = clock.apply(lambda m: np.nan if pd.isna(m) else float((int(m) - int(anchor_min)) % 1440))
+
+    # Si existe otra lectura exactamente a la hora inicial y aparece después en
+    # la secuencia fuente, tratarla como cierre del día siguiente (24 h), no 0 h.
+    zero_idxs = list(elapsed[elapsed == 0].index)
+    if len(zero_idxs) > 1:
+        for idx in zero_idxs[1:]:
+            elapsed.loc[idx] = 1440.0
+
+    out['tplot'] = elapsed.astype(float)
+    out = out.sort_values(['tplot', '_source_order'], kind='mergesort', na_position='last').reset_index(drop=True)
+
+    # Base de fecha sólo para trazabilidad; el gráfico usa tplot.
+    if base_date is None:
+        base_dt = pd.Timestamp('2000-01-01')
+    else:
+        try:
+            base_dt = pd.Timestamp(base_date)
+        except Exception:
+            base_dt = pd.Timestamp('2000-01-01')
+    # La primera lectura ocurre a anchor_min dentro del día base.
+    anchor_dt = base_dt.normalize() + pd.Timedelta(minutes=int(anchor_min))
+    out['dt'] = [anchor_dt + pd.Timedelta(minutes=float(v)) if pd.notna(v) else pd.NaT for v in out['tplot']]
+    out['x_time_hours'] = out['tplot'] / 60.0
+    out['hora_label'] = out['hora'].astype(str).str.slice(0, 5)
+
+    return out.drop(columns=['_source_order'], errors='ignore')
+
+
 def _ensure_datetime_sequence(df, meta=None):
     """
-    Construye eje temporal cronológico.
-    Para PDFs MedicalDB OCR se prioriza el ORDEN DE FILA y la fecha de inicio
-    del estudio, porque el OCR puede leer 04/06 como 05/06 en alguna celda.
+    Construye el eje temporal MAPA evitando días artificiales por filas OCR.
+    El eje se ancla SIEMPRE en el primer horario válido reportado en la tabla;
+    la hora de inicio de carátula queda únicamente como respaldo.
     """
-    df = df.copy().reset_index(drop=True)
     meta = meta or {}
-
-    # Usar orden de fila si existe.
-    if 'nro' in df.columns:
-        try:
-            df['nro'] = pd.to_numeric(df['nro'], errors='coerce')
-            if df['nro'].notna().sum() >= max(5, len(df)//2):
-                df = df.sort_values('nro').reset_index(drop=True)
-        except Exception:
-            pass
-
-    # Base desde fecha/hora de inicio si está disponible.
     base_date = None
     try:
-        if meta.get("fecha_inicio"):
-            base_date = datetime.strptime(meta["fecha_inicio"], "%d/%m/%Y").date()
+        if meta.get('fecha_inicio'):
+            base_date = datetime.strptime(meta['fecha_inicio'], '%d/%m/%Y')
     except Exception:
         base_date = None
 
-    mins = df["hora"].apply(time_to_minutes).astype(float) if "hora" in df.columns else pd.Series([np.nan]*len(df))
-    corrected = []
-    offset = 0
-    prev = None
-    for m in mins:
-        if pd.isna(m):
-            corrected.append(np.nan)
-            continue
-        m2 = float(m) + offset
-        if prev is not None and m2 < prev - 360:
-            offset += 1440
-            m2 = float(m) + offset
-        corrected.append(m2)
-        prev = m2
+    out = _canonicalize_mapa_time_axis(
+        df,
+        anchor_time=meta.get('hora_inicio'),
+        base_date=base_date,
+    )
 
-    # Si existe base_date, crear dt desde base + minutos; ajustar si la primera hora
-    # de tabla es anterior a hora_inicio por muchas horas.
-    if base_date is not None and len(corrected) > 0 and not pd.isna(corrected[0]):
-        start_min = time_to_minutes(meta.get("hora_inicio", "")) if meta.get("hora_inicio") else None
-        first_min = corrected[0]
-        base_dt = datetime.combine(base_date, datetime.min.time())
-        if start_min is not None:
-            # anclar el día al horario de la primera lectura; si primera lectura está
-            # antes del inicio por >6 h, asumir que corresponde al día siguiente.
-            add_day = 1 if first_min < start_min - 360 else 0
-            base_dt = base_dt + pd.Timedelta(days=add_day)
-        df["dt"] = [base_dt + pd.Timedelta(minutes=float(x)) if not pd.isna(x) else pd.NaT for x in corrected]
-        df["tplot"] = [(x - df["dt"].dropna().iloc[0]).total_seconds()/60 if pd.notna(x) and df["dt"].notna().any() else np.nan for x in df["dt"]]
-        df["hora_label"] = df["hora"].astype(str).str.slice(0,5)
-        # Completar/normalizar fecha según dt calculado.
-        df["fecha"] = [x.strftime("%d/%m/%Y") if pd.notna(x) else "" for x in df["dt"]]
-        return df
-
-    # Fallback: si hay fechas confiables, usarlas.
-    if "fecha" in df.columns:
-        dt = pd.to_datetime(df["fecha"].astype(str) + " " + df["hora"].astype(str),
-                            dayfirst=True, errors="coerce")
-    else:
-        dt = pd.Series([pd.NaT]*len(df))
-
-    if dt.notna().sum() >= max(5, len(df)//2):
-        df["dt"] = dt
-        # No ordenar por fecha si hay nro: ya se ordenó por fila.
-        if 'nro' not in df.columns:
-            df = df.sort_values("dt").reset_index(drop=True)
-        base = df["dt"].dropna().iloc[0]
-        df["tplot"] = (df["dt"] - base).dt.total_seconds() / 60.0
-        df["hora_label"] = df["dt"].dt.strftime("%H:%M")
-    else:
-        df["tplot"] = corrected
-        df["hora_label"] = df["hora"].astype(str).str.slice(0,5)
-    return df
+    # Completar fecha de modo coherente con el eje reconstruido.
+    if 'dt' in out.columns:
+        out['fecha'] = [x.strftime('%d/%m/%Y') if pd.notna(x) else '' for x in out['dt']]
+    return out
 
 def _parse_from_tables(tables):
     best = None
@@ -1779,104 +1800,69 @@ def _extract_meta(text):
 
     return meta
 
+
 def assign_periods(df, noc_start=23, noc_end=7, diurno_desde_primera=True):
     """
-    Asigna período Diurno/Nocturno.
+    Asigna período Diurno/Nocturno sobre el eje temporal continuo.
 
-    Corrección para MAPA:
-    - Si la tabla original NO trae una etiqueta confiable de período, el período
-      diurno se considera desde la primera medición válida del estudio.
-    - El eje temporal se reconstruye en orden de lectura, con cruce de medianoche.
-    - El período nocturno comienza en noc_start y finaliza en noc_end.
-    - Si la tabla original ya trae "Día/Diurno" o "Noche/Nocturno", se respeta.
+    Regla operativa solicitada:
+    - La PRIMERA medición válida inicia el período DIURNO.
+    - Desde allí, el primer período nocturno comienza al alcanzar noc_start.
+    - Finaliza en noc_end y luego vuelve a Diurno.
+    - La clasificación se recalcula de forma coherente para todas las lecturas;
+      no se conservan etiquetas OCR aisladas que puedan fragmentar el gráfico.
     """
-    df = df.copy()
+    out = df.copy()
+    if len(out) == 0:
+        out['Período'] = pd.Series(dtype='object')
+        return out
 
-    def _period_from_clock_min(mins):
-        if mins is None or pd.isna(mins):
-            return 'Diurno'
-        hr = int(mins) // 60
-        return 'Nocturno' if (hr >= int(noc_start) or hr < int(noc_end)) else 'Diurno'
-
-    def _absolute_minutes_from_hora(horas):
-        vals = []
-        offset = 0
-        prev = None
-        for h in horas:
-            m = time_to_minutes(h)
-            if m is None:
-                vals.append(np.nan)
-                continue
-            m2 = float(m) + offset
-            if prev is not None and m2 < prev - 360:
-                offset += 1440
-                m2 = float(m) + offset
-            vals.append(m2)
-            prev = m2
-        return pd.Series(vals, index=df.index, dtype='float64')
-
-    def _periods_from_first_measurement():
-        if 'hora' not in df.columns or len(df) == 0:
-            return pd.Series(['Diurno'] * len(df), index=df.index)
-
-        abs_min = _absolute_minutes_from_hora(df['hora'])
-        clock_min = df['hora'].apply(time_to_minutes)
-        out = pd.Series(index=df.index, dtype='object')
-
-        valid = abs_min.dropna()
-        if valid.empty:
-            return df['hora'].apply(lambda h: _period_from_clock_min(time_to_minutes(h)))
-
-        first_idx = valid.index[0]
-        first_clock = time_to_minutes(df.loc[first_idx, 'hora'])
-
-        # Por indicación operativa: cuando no hay etiqueta Día/Noche en la
-        # tabla original, el período diurno comienza SIEMPRE en la primera
-        # medición válida y finaliza al primer inicio nocturno posterior.
-        if first_clock is not None and diurno_desde_primera:
-            first_abs = float(abs_min.loc[first_idx])
-            # Primer inicio nocturno posterior a la primera lectura.
-            noc_start_clock = int(noc_start) * 60
-            delta_to_noc = (noc_start_clock - first_clock) % 1440
-            if delta_to_noc == 0:
-                first_noc_start_abs = first_abs
-            else:
-                first_noc_start_abs = first_abs + delta_to_noc
-
-            for idx, a in abs_min.items():
-                if pd.isna(a):
-                    out.loc[idx] = 'Diurno'
-                    continue
-                rel = (float(a) - first_noc_start_abs) % 1440
-                # Desde primera medición hasta el primer inicio nocturno = Diurno.
-                if float(a) < first_noc_start_abs:
-                    out.loc[idx] = 'Diurno'
-                # Entre inicio nocturno y fin nocturno = Nocturno.
-                elif 0 <= rel < ((int(noc_end) * 60 - int(noc_start) * 60) % 1440):
-                    out.loc[idx] = 'Nocturno'
-                else:
-                    out.loc[idx] = 'Diurno'
-            return out
-
-        # Respaldo si la hora inicial no pudo interpretarse.
-        return clock_min.apply(_period_from_clock_min)
-
-    calc_periods = _periods_from_first_measurement()
-
-    if 'Período' not in df.columns:
-        df['Período'] = calc_periods
-        df['periodo_asumido'] = True
+    # Asegurar eje continuo. Si tplot parece corrupto (>30 h en un MAPA estándar),
+    # reconstruirlo desde las horas de reloj.
+    need_rebuild = ('tplot' not in out.columns or pd.to_numeric(out.get('tplot'), errors='coerce').isna().all())
+    if not need_rebuild:
+        tp = pd.to_numeric(out['tplot'], errors='coerce')
+        try:
+            need_rebuild = (tp.max() - tp.min()) > 1800  # >30 h: muy probablemente eje OCR espurio
+        except Exception:
+            need_rebuild = True
+    if need_rebuild:
+        out = _canonicalize_mapa_time_axis(out)
     else:
-        def norm_period(row):
-            val = str(row.get('Período', '')).lower().strip()
-            if 'noch' in val or 'noct' in val:
-                return 'Nocturno'
-            if 'dia' in val or 'diur' in val or 'día' in val:
-                return 'Diurno'
-            return calc_periods.loc[row.name] if row.name in calc_periods.index else 'Diurno'
-        df['Período'] = df.apply(norm_period, axis=1)
-        df['periodo_asumido'] = False
-    return df
+        out['tplot'] = pd.to_numeric(out['tplot'], errors='coerce')
+        out = out.sort_values('tplot', kind='mergesort').reset_index(drop=True)
+
+    # Hora de reloj de la primera medición real del eje.
+    first_clock = None
+    if 'hora' in out.columns and len(out):
+        first_clock = time_to_minutes(out.iloc[0]['hora'])
+    if first_clock is None:
+        first_clock = 0
+
+    night_start_elapsed = float((int(noc_start) * 60 - int(first_clock)) % 1440)
+    night_duration = float((int(noc_end) * 60 - int(noc_start) * 60) % 1440)
+    if night_duration == 0:
+        night_duration = 8 * 60.0
+
+    t = pd.to_numeric(out['tplot'], errors='coerce')
+    first_t = float(t.dropna().iloc[0]) if t.notna().any() else 0.0
+    elapsed = t - first_t
+
+    periods = []
+    for e in elapsed:
+        if pd.isna(e):
+            periods.append('Diurno')
+            continue
+        e = float(e)
+        if diurno_desde_primera and e < night_start_elapsed:
+            periods.append('Diurno')
+            continue
+        rel = (e - night_start_elapsed) % 1440.0
+        periods.append('Nocturno' if 0.0 <= rel < night_duration else 'Diurno')
+
+    out['Período'] = periods
+    out['periodo_asumido'] = True
+    return out
 
 def clean_data(df):
     orig = len(df)
@@ -2063,6 +2049,32 @@ def classify_phenotype(m):
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+
+def _line_with_gap_breaks(ax, x, y, *, gap_hours=None, **plot_kwargs):
+    """Grafica una serie sin unir visualmente intervalos anormalmente largos."""
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    finite = np.isfinite(x) & np.isfinite(y)
+    xf = x[finite]
+    if gap_hours is None:
+        diffs = np.diff(xf)
+        diffs = diffs[(diffs > 0) & np.isfinite(diffs)]
+        typical = float(np.median(diffs)) if len(diffs) else 0.5
+        gap_hours = max(1.5, typical * 4.0)
+
+    xx, yy = [], []
+    prev_x = None
+    for xi, yi in zip(x, y):
+        if not np.isfinite(xi) or not np.isfinite(yi):
+            xx.append(np.nan); yy.append(np.nan)
+            prev_x = None
+            continue
+        if prev_x is not None and (xi - prev_x) > gap_hours:
+            xx.append(np.nan); yy.append(np.nan)
+        xx.append(float(xi)); yy.append(float(yi))
+        prev_x = float(xi)
+    return ax.plot(xx, yy, **plot_kwargs)
+
 def generate_chart(df, m):
     """
     Gráfico canónico ÚNICO del informe.
@@ -2117,10 +2129,14 @@ def generate_chart(df, m):
                 )
 
     # Curvas PAS/PAD en el tiempo real transcurrido.
-    ax.plot(x, df['PAS'].astype(float), color='#1f77b4', lw=1.7, marker='o', ms=4.2,
-            label='PAS', zorder=3)
-    ax.plot(x, df['PAD'].astype(float), color='#ff7f0e', lw=1.7, marker='o', ms=4.2,
-            label='PAD', zorder=3)
+    _line_with_gap_breaks(
+        ax, x, df['PAS'].astype(float).to_numpy(),
+        color='#1f77b4', lw=1.7, marker='o', ms=4.2, label='PAS', zorder=3
+    )
+    _line_with_gap_breaks(
+        ax, x, df['PAD'].astype(float).to_numpy(),
+        color='#ff7f0e', lw=1.7, marker='o', ms=4.2, label='PAD', zorder=3
+    )
 
     # Umbrales por período, punto a punto sobre las mismas lecturas.
     periods = df['Período'].astype(str).to_numpy()
@@ -2176,53 +2192,52 @@ def generate_chart(df, m):
     return buf
 
 
+
+
 def _prepare_df_for_chart(df):
     """
-    Devuelve un DataFrame ordenado cronológicamente y con períodos consistentes.
-    No descarta filas; sólo normaliza columnas necesarias para el gráfico.
-    Además crea x_time_hours: horas transcurridas desde la primera medición válida.
+    Prepara las mismas lecturas depuradas sobre un eje temporal continuo.
+    Si el cálculo principal ya dejó un tplot canónico (0-24 h), se conserva.
+    Sólo se reconstruye cuando falta o muestra un rango temporal imposible.
     """
     out = df.copy()
-
     if 'hora' not in out.columns:
-        raise ValueError("La tabla depurada no contiene columna hora para graficar.")
-    out['hora'] = out['hora'].astype(str).str.slice(0, 5)
+        raise ValueError('La tabla depurada no contiene columna hora para graficar.')
 
-    # Reconstruir o respetar eje temporal cronológico. tplot está en minutos.
-    if 'tplot' not in out.columns or out['tplot'].isna().all():
-        out = _ensure_datetime_sequence(out, {})
-    else:
+    use_existing = False
+    if 'tplot' in out.columns:
+        tp = pd.to_numeric(out['tplot'], errors='coerce')
+        if tp.notna().sum() >= max(3, len(out) // 2):
+            span = float(tp.max() - tp.min()) if tp.notna().any() else np.inf
+            use_existing = np.isfinite(span) and span <= 1560  # <=26 h
+
+    if use_existing:
         out['tplot'] = pd.to_numeric(out['tplot'], errors='coerce')
-        out = out.sort_values('tplot').reset_index(drop=True)
+        # Preservar el origen ya fijado por la primera medición reportada.
+        # No volver a poner en cero la primera fila sobreviviente después de la
+        # depuración, porque eso podría cambiar el horario inicial del estudio.
+        out = out.sort_values('tplot', kind='mergesort').reset_index(drop=True)
+        if out['tplot'].notna().any() and float(out['tplot'].min()) < 0:
+            out['tplot'] = out['tplot'] - float(out['tplot'].min())
+    else:
+        # La propia función canónica toma como t=0 el primer horario reportado.
+        out = _canonicalize_mapa_time_axis(out)
 
-    # No recalcular de forma rígida 23-7 si la tabla ya fue clasificada en main().
-    # Sólo completar períodos faltantes usando la misma lógica de diurno desde
-    # la primera medición.
+    # Preservar la clasificación realizada en main() con el horario nocturno
+    # elegido por el usuario. Sólo calcular si realmente falta.
     if 'Período' not in out.columns or out['Período'].isna().all():
         out = assign_periods(out, diurno_desde_primera=True)
     else:
         per = out['Período'].astype(str).str.strip().str.lower()
-        calc = assign_periods(out.drop(columns=['Período'], errors='ignore'), diurno_desde_primera=True)['Período']
         out['Período'] = np.where(
             per.str.contains('noch|noct', regex=True), 'Nocturno',
-            np.where(per.str.contains('dia|diur|día', regex=True), 'Diurno', calc)
+            np.where(per.str.contains('dia|diur|día', regex=True), 'Diurno', 'Diurno')
         )
 
-    if 'tplot' in out.columns and out['tplot'].notna().any():
-        out['tplot'] = pd.to_numeric(out['tplot'], errors='coerce')
-        out = out.sort_values('tplot').reset_index(drop=True)
-        first_t = float(out['tplot'].dropna().iloc[0])
-        out['x_time_hours'] = (out['tplot'] - first_t) / 60.0
-    else:
-        out = out.reset_index(drop=True)
-        out['x_time_hours'] = np.arange(len(out), dtype=float)
-
+    out['x_time_hours'] = pd.to_numeric(out['tplot'], errors='coerce') / 60.0
     out['xidx'] = np.arange(len(out), dtype=float)
-    if 'hora_label' not in out.columns or out['hora_label'].isna().all():
-        out['hora_label'] = out['hora']
-    out['hora_label'] = out['hora_label'].astype(str).str.slice(0, 5)
-
-    return out
+    out['hora_label'] = out['hora'].astype(str).str.slice(0, 5)
+    return out.reset_index(drop=True)
 
 def _dataset_fingerprint(df):
     cols = [c for c in ['fecha','hora','PAS','PAD','FC','PAM','PP','Período'] if c in df.columns]
@@ -2554,38 +2569,49 @@ def _time_span_bounds(x, s, e):
     return float(left), float(right)
 
 
+
 def _fmt_x_time_axis(ax, df):
     """
-    Etiquetas del eje X en tiempo real transcurrido desde la primera medición.
-    Muestra la hora real de lectura y el período D/N.
+    Eje X temporal legible: ticks regulares en horas transcurridas, con la hora
+    de reloj correspondiente. Evita superposición de etiquetas en conglomerados.
     """
     n = len(df)
     if n == 0:
         return
-
     x = pd.to_numeric(df.get('x_time_hours', pd.Series(np.arange(n))), errors='coerce').to_numpy(dtype=float)
-    if np.isnan(x).all():
-        x = np.arange(n, dtype=float)
+    finite = x[np.isfinite(x)]
+    if len(finite) == 0:
+        return
 
-    # Usar índices equiespaciados para que las etiquetas correspondan a mediciones reales.
-    max_ticks = 14
-    idxs = np.linspace(0, n - 1, num=min(max_ticks, n), dtype=int).tolist()
-    idxs = sorted(set(idxs + [0, n - 1]))
+    xmin, xmax = float(np.min(finite)), float(np.max(finite))
+    span = max(0.0, xmax - xmin)
+    if span <= 8:
+        step = 1.0
+    elif span <= 16:
+        step = 2.0
+    elif span <= 26:
+        step = 3.0
+    else:
+        step = 4.0
 
-    ticks, labels = [], []
-    for i in idxs:
-        if not np.isfinite(x[i]):
-            continue
-        hora = str(df.loc[i, 'hora_label'] if 'hora_label' in df.columns else df.loc[i, 'hora'])[:5]
-        per = 'N' if str(df.loc[i, 'Período']) == 'Nocturno' else 'D'
-        elapsed = float(x[i])
-        labels.append(f"{hora}\n{elapsed:.1f} h · {per}")
-        ticks.append(elapsed)
+    ticks = list(np.arange(0.0, xmax + step * 0.35, step))
+    if not ticks or abs(ticks[-1] - xmax) > step * 0.45:
+        ticks.append(xmax)
+    ticks = sorted(set(round(float(t), 6) for t in ticks if t <= xmax + 1e-6))
+
+    first_clock = time_to_minutes(str(df.iloc[0]['hora'])[:5]) if 'hora' in df.columns else None
+    labels = []
+    for t in ticks:
+        if first_clock is None:
+            clock_label = f'{t:.0f} h'
+        else:
+            total = int(round(first_clock + t * 60)) % 1440
+            clock_label = f'{total // 60:02d}:{total % 60:02d}'
+        labels.append(f'{clock_label}\n{t:g} h')
 
     ax.set_xticks(ticks)
-    ax.set_xticklabels(labels, rotation=0, fontsize=7)
-    ax.set_xlabel('Tiempo desde la primera medición hasta la última (horas; D=diurno, N=nocturno)', fontsize=9)
-
+    ax.set_xticklabels(labels, rotation=0, fontsize=7.5)
+    ax.set_xlabel('Horas transcurridas desde la primera medición (hora real)', fontsize=9)
 
 def _fmt_x_index(ax, df):
     """
@@ -3209,7 +3235,7 @@ def main():
         st.markdown("**Período nocturno para filas sin etiqueta**")
         noc_start = st.number_input("Inicio nocturno (hs)", 20, 24, 23, 1)
         noc_end   = st.number_input("Fin nocturno (hs)", 4, 10, 7, 1)
-        st.caption("Si la tabla no trae Día/Noche, el período diurno se inicia en la primera medición válida del estudio.")
+        st.caption("Regla temporal: la primera medición es la primera fila con horario válido reportada por el equipo; ese horario fija t=0 h y el período diurno comienza allí.")
         st.markdown("---")
 
         if st.button("♻️ Reprocesar PDF / limpiar caché", use_container_width=True):
@@ -3393,15 +3419,21 @@ def main():
         with st.spinner("Depurando lecturas, recalculando métricas y generando informe..."):
             df_work = df_raw.copy()
 
-            # Si el parser trae períodos desde la tabla, se respetan; si faltan, se asignan por horario.
-            if "Período" not in df_work.columns or df_work["Período"].isna().all():
-                df_work = assign_periods(df_work, noc_start=int(noc_start), noc_end=int(noc_end))
-            else:
-                tmp = assign_periods(df_work.drop(columns=["Período"], errors="ignore"),
-                                     noc_start=int(noc_start), noc_end=int(noc_end))
-                df_work["Período"] = df_work["Período"].fillna(tmp["Período"])
-                df_work["Período"] = df_work["Período"].replace("", np.nan).fillna(tmp["Período"])
-                df_work["periodo_asumido"] = False
+            # Eje temporal canónico: la PRIMERA fila con horario válido de la
+            # tabla del equipo es la primera medición y fija t=0 h. La hora de
+            # inicio de carátula/formulario NO desplaza ese origen.
+            df_work = _canonicalize_mapa_time_axis(
+                df_work,
+                anchor_time=hora_inicio,  # sólo fallback si la tabla carece de horas válidas
+                base_date=fecha_estudio,
+            )
+
+            # Recalcular períodos para TODO el estudio: primera medición = inicio
+            # diurno; primer nocturno posterior = noc_start; fin = noc_end.
+            df_work = assign_periods(
+                df_work, noc_start=int(noc_start), noc_end=int(noc_end),
+                diurno_desde_primera=True
+            )
 
             df_clean, excluded, n_orig = clean_data(df_work)
 
@@ -3522,7 +3554,7 @@ def main():
         if chart_bytes:
             st.image(
                 chart_bytes,
-                caption="Eje X: tiempo transcurrido desde la primera medición hasta la última. El período diurno comienza en la primera medición válida del estudio cuando la tabla no trae una etiqueta Día/Noche confiable.",
+                caption="Eje X continuo: t=0 corresponde exactamente al primer horario válido reportado en la tabla del equipo. La hora de carátula no desplaza ese origen; se evita sumar días artificiales por desorden OCR y los intervalos prolongados reales se muestran sin unir con una línea.",
                 use_container_width=True
             )
         else:
