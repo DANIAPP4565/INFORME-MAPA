@@ -2195,6 +2195,20 @@ def _excel_safe_value(v):
     return v
 
 
+def _df_excel_safe(df):
+    """
+    Aplica limpieza celda por celda compatible con pandas moderno.
+    pandas >=2.1 reemplazó DataFrame.applymap por DataFrame.map;
+    usar este helper evita que el guardado en Excel bloquee los cálculos.
+    """
+    if df is None:
+        return df
+    try:
+        return df.map(_excel_safe_value)
+    except AttributeError:
+        return df.applymap(_excel_safe_value)
+
+
 def _repo_summary_row(df_clean, m, pat, stu, phenotype, excluded, n_orig, base_name):
     fp = _dataset_fingerprint(df_clean)
     study_id = f"MAPA_{fp[:12].upper()}"
@@ -2253,7 +2267,7 @@ def _repo_measurements_df(df_clean, study_id):
     for c in out.columns:
         if c in ["dt"] or str(out[c].dtype).startswith("datetime"):
             out[c] = pd.to_datetime(out[c], errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S")
-    return out.applymap(_excel_safe_value)
+    return _df_excel_safe(out)
 
 
 def save_study_to_excel_repository(df_clean, m, pat, stu, phenotype, excluded, n_orig, base_name):
@@ -2261,13 +2275,18 @@ def save_study_to_excel_repository(df_clean, m, pat, stu, phenotype, excluded, n
     Guarda automáticamente cada MAPA procesado en un Excel acumulativo:
     - Hoja ESTUDIOS: una fila por estudio.
     - Hoja MEDICIONES_VALIDADAS: una fila por medición validada.
-    Si se regenera el mismo estudio, reemplaza las filas con la misma huella.
-    """
-    study_id, summary = _repo_summary_row(df_clean, m, pat, stu, phenotype, excluded, n_orig, base_name)
-    meas_new = _repo_measurements_df(df_clean, study_id)
-    summary_new = pd.DataFrame([summary]).applymap(_excel_safe_value)
 
+    Corrección crítica:
+    El repositorio Excel no debe interrumpir el cálculo ni la generación del PDF.
+    Por eso todo el bloque queda dentro de try/except y la limpieza de celdas
+    usa _df_excel_safe(), compatible con pandas reciente.
+    """
+    study_id = "MAPA_SIN_ID"
     try:
+        study_id, summary = _repo_summary_row(df_clean, m, pat, stu, phenotype, excluded, n_orig, base_name)
+        meas_new = _repo_measurements_df(df_clean, study_id)
+        summary_new = _df_excel_safe(pd.DataFrame([summary]))
+
         REPO_DIR.mkdir(parents=True, exist_ok=True)
 
         if REPO_XLSX.exists():
