@@ -1987,18 +1987,19 @@ def classify_phenotype(m):
 # CHART GENERATION
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def generate_chart(df, m):
     """
     Gráfico canónico ÚNICO del informe.
 
-    CORRECCIÓN v67:
-    - El eje X usa el número secuencial de medición depurada, NO una escala continua de horas.
-      Esto evita que, en registros con saltos horarios o lecturas excluidas, el período nocturno
-      parezca "sin registros" por compresión/espacios vacíos.
-    - La franja nocturna se dibuja sobre los índices reales de las mediciones nocturnas.
-    - Se grafican todos los puntos PAS/PAD presentes en df_clean, el mismo DataFrame usado
-      para cálculos, tabla y conclusiones.
-    - Se agregan contadores visibles de lecturas diurnas/nocturnas y huella de dataset.
+    CORRECCIÓN v68:
+    - El eje X vuelve a ser una escala temporal continua, expresada como horas
+      desde la primera medición válida hasta la última medición válida.
+    - Las etiquetas muestran la hora real de cada lectura y el período D/N.
+    - Las franjas diurna/nocturna se dibujan respetando el tiempo real entre
+      mediciones, no sólo el número secuencial de registro.
+    - Se grafican exactamente las mismas lecturas depuradas usadas para los
+      cálculos, tablas, conclusiones y repositorio Excel.
     """
     df = _prepare_df_for_chart(df)
 
@@ -2014,37 +2015,39 @@ def generate_chart(df, m):
         )
 
     thr = m.get('thresholds', THRESHOLDS)
-    x = np.arange(len(df), dtype=float)
+    x = pd.to_numeric(df['x_time_hours'], errors='coerce').to_numpy(dtype=float)
+    if np.isnan(x).all():
+        x = np.arange(len(df), dtype=float)
+        df['x_time_hours'] = x
 
-    fig, ax = plt.subplots(1, 1, figsize=(14, 5.8), dpi=130)
+    fig, ax = plt.subplots(1, 1, figsize=(14.5, 5.8), dpi=130)
 
-    # Bandas de fondo por períodos reales de medición.
-    # Se diferencian visualmente DIURNO y NOCTURNO para evitar ambigüedad.
+    # Bandas de fondo por períodos reales en eje temporal continuo.
     for period_name, shade_color, shade_alpha in [
         ('Diurno', '#FFF2CC', 0.30),
         ('Nocturno', '#DDEBFF', 0.62),
     ]:
         for s, e in _period_segments_index(df, period_name):
-            ax.axvspan(s - 0.50, e + 0.50, alpha=shade_alpha, color=shade_color, zorder=0)
-            ax.axvline(s - 0.50, color='#888888', lw=0.45, alpha=0.35, zorder=1)
-            ax.axvline(e + 0.50, color='#888888', lw=0.45, alpha=0.35, zorder=1)
-            # Etiqueta interna del bloque. get_xaxis_transform usa x en datos e y en eje.
+            left, right = _time_span_bounds(x, s, e)
+            ax.axvspan(left, right, alpha=shade_alpha, color=shade_color, zorder=0)
+            ax.axvline(left, color='#888888', lw=0.45, alpha=0.35, zorder=1)
+            ax.axvline(right, color='#888888', lw=0.45, alpha=0.35, zorder=1)
             if (e - s + 1) >= 3:
                 ax.text(
-                    (s + e) / 2, 0.985, period_name.upper(),
+                    (left + right) / 2, 0.985, period_name.upper(),
                     transform=ax.get_xaxis_transform(),
                     ha='center', va='top', fontsize=7, fontweight='bold',
                     color=('#1F3864' if period_name == 'Nocturno' else '#7A5A00'),
                     alpha=0.85, zorder=2
                 )
 
-    # Curvas PAS/PAD. Se usa marker para que cada registro sea visible.
+    # Curvas PAS/PAD en el tiempo real transcurrido.
     ax.plot(x, df['PAS'].astype(float), color='#1f77b4', lw=1.7, marker='o', ms=4.2,
             label='PAS', zorder=3)
     ax.plot(x, df['PAD'].astype(float), color='#ff7f0e', lw=1.7, marker='o', ms=4.2,
             label='PAD', zorder=3)
 
-    # Umbrales por período, calculados punto a punto sobre las mismas filas.
+    # Umbrales por período, punto a punto sobre las mismas lecturas.
     periods = df['Período'].astype(str).to_numpy()
     sys_thr = np.array([thr['nocturno']['sys'] if p == 'Nocturno' else thr['diurno']['sys'] for p in periods], dtype=float)
     dia_thr = np.array([thr['nocturno']['dia'] if p == 'Nocturno' else thr['diurno']['dia'] for p in periods], dtype=float)
@@ -2062,22 +2065,27 @@ def generate_chart(df, m):
 
     ax.set_title('MAPA: mediciones validadas de presión arterial', fontsize=12, fontweight='bold')
     ax.set_ylabel('mmHg', fontsize=10)
-    ax.set_xlabel('Hora de medición', fontsize=10)
 
     ymin = max(30, min(float(df['PAD'].min()) - 12, 45))
     ymax = min(250, max(float(df['PAS'].max()) + 18, 150))
     ax.set_ylim(ymin, ymax)
-    ax.set_xlim(-0.8, len(df) - 0.2)
+
+    xmin = float(np.nanmin(x))
+    xmax = float(np.nanmax(x))
+    margin = max(0.15, (xmax - xmin) * 0.015) if xmax > xmin else 0.5
+    ax.set_xlim(xmin - margin, xmax + margin)
     ax.grid(True, alpha=0.28)
 
-    _fmt_x_index(ax, df)
+    _fmt_x_time_axis(ax, df)
 
     # Trazabilidad: número de registros de cada período y huella del dataset graficado.
     try:
         fp = _dataset_fingerprint(df)
+        first_h = str(df['hora_label'].iloc[0])[:5]
+        last_h = str(df['hora_label'].iloc[-1])[:5]
         ax.text(
             0.995, 0.01,
-            f"n={len(df)} · Diurno={n_dia} · Nocturno={n_noc} · ID {fp[:8]}",
+            f"n={len(df)} · Diurno={n_dia} · Nocturno={n_noc} · {first_h}–{last_h} · ID {fp[:8]}",
             transform=ax.transAxes, ha='right', va='bottom',
             fontsize=6.5, color='#666666'
         )
@@ -2097,21 +2105,21 @@ def _prepare_df_for_chart(df):
     """
     Devuelve un DataFrame ordenado cronológicamente y con períodos consistentes.
     No descarta filas; sólo normaliza columnas necesarias para el gráfico.
+    Además crea x_time_hours: horas transcurridas desde la primera medición válida.
     """
     out = df.copy()
 
-    # Asegurar hora legible.
     if 'hora' not in out.columns:
         raise ValueError("La tabla depurada no contiene columna hora para graficar.")
     out['hora'] = out['hora'].astype(str).str.slice(0, 5)
 
-    # Si no hay fecha o dt/tplot, reconstruir secuencia cronológica.
+    # Reconstruir o respetar eje temporal cronológico. tplot está en minutos.
     if 'tplot' not in out.columns or out['tplot'].isna().all():
         out = _ensure_datetime_sequence(out, {})
     else:
+        out['tplot'] = pd.to_numeric(out['tplot'], errors='coerce')
         out = out.sort_values('tplot').reset_index(drop=True)
 
-    # Normalizar período: si falta, se calcula por horario estándar 23:00–07:00.
     def _period_from_time_for_chart(h):
         mins = time_to_minutes(h)
         if mins is None:
@@ -2129,18 +2137,21 @@ def _prepare_df_for_chart(df):
             np.where(per.str.contains('dia|diur', regex=True), 'Diurno', calc)
         )
 
-    # Orden final. Si hay tplot, preserva cruce de medianoche; si no, orden original.
     if 'tplot' in out.columns and out['tplot'].notna().any():
+        out['tplot'] = pd.to_numeric(out['tplot'], errors='coerce')
         out = out.sort_values('tplot').reset_index(drop=True)
+        first_t = float(out['tplot'].dropna().iloc[0])
+        out['x_time_hours'] = (out['tplot'] - first_t) / 60.0
     else:
         out = out.reset_index(drop=True)
+        out['x_time_hours'] = np.arange(len(out), dtype=float)
 
     out['xidx'] = np.arange(len(out), dtype=float)
     if 'hora_label' not in out.columns or out['hora_label'].isna().all():
         out['hora_label'] = out['hora']
+    out['hora_label'] = out['hora_label'].astype(str).str.slice(0, 5)
 
     return out
-
 
 def _dataset_fingerprint(df):
     cols = [c for c in ['fecha','hora','PAS','PAD','FC','PAM','PP','Período'] if c in df.columns]
@@ -2257,24 +2268,88 @@ def _repo_summary_row(df_clean, m, pat, stu, phenotype, excluded, n_orig, base_n
     }
 
 
-def _repo_measurements_df(df_clean, study_id):
-    out = df_clean.copy().reset_index(drop=True)
-    out.insert(0, "id_estudio", study_id)
-    out.insert(1, "fila_validada", np.arange(1, len(out) + 1))
-    out["validada"] = True
-    out["criterio_validacion"] = "PAD 40-130; PAS <=230; PP 20-80"
-    # Excel no maneja bien algunas columnas con Timestamp/NaT mixtas si quedan como objeto.
+
+def _repo_measurements_df(df_clean, study_id, pat=None, stu=None, phenotype=""):
+    """
+    Hoja MEDICIONES_VALIDADAS del repositorio .xlsx.
+    Una fila = una medición validada del MAPA, con datos filiatorios mínimos
+    repetidos para que el Excel pueda filtrarse por paciente sin hacer cruces.
+    """
+    pat = pat or {}
+    stu = stu or {}
+    src = df_clean.copy().reset_index(drop=True)
+
+    # Normalizar campos de tiempo/fecha.
+    if 'hora' in src.columns:
+        hora_med = src['hora'].astype(str).str.slice(0, 5)
+    else:
+        hora_med = pd.Series([""] * len(src))
+    if 'fecha' in src.columns:
+        fecha_med = src['fecha'].astype(str)
+    else:
+        fecha_med = pd.Series([stu.get("fecha", "")] * len(src))
+
+    if 'dt' in src.columns:
+        dt_med = pd.to_datetime(src['dt'], errors='coerce').dt.strftime("%Y-%m-%d %H:%M:%S")
+    else:
+        dt_med = pd.Series([""] * len(src))
+
+    if 'tplot' in src.columns:
+        t_min = pd.to_numeric(src['tplot'], errors='coerce')
+        if t_min.notna().any():
+            t_min = (t_min - t_min.dropna().iloc[0]).round(2)
+    else:
+        t_min = pd.Series([""] * len(src))
+
+    def _col(name):
+        return pd.to_numeric(src[name], errors='coerce') if name in src.columns else pd.Series([""] * len(src))
+
+    out = pd.DataFrame({
+        "id_estudio": study_id,
+        "fila_validada": np.arange(1, len(src) + 1),
+        "paciente": pat.get("nombre", ""),
+        "codigo_paciente_hash": hashlib.sha256(str(pat.get('nombre','')).encode('utf-8')).hexdigest()[:12],
+        "edad": pat.get("edad", ""),
+        "sexo": pat.get("sexo", ""),
+        "obra_social": pat.get("obra_social", ""),
+        "fecha_estudio": stu.get("fecha", ""),
+        "hora_inicio_estudio": stu.get("inicio", ""),
+        "hora_fin_estudio": stu.get("fin", ""),
+        "duracion_estudio": stu.get("duracion", ""),
+        "fenotipo": phenotype,
+        "fecha_medicion": fecha_med,
+        "hora_medicion": hora_med,
+        "datetime_medicion": dt_med,
+        "tiempo_desde_inicio_min": t_min,
+        "periodo": src["Período"] if "Período" in src.columns else "",
+        "PAS": _col("PAS"),
+        "PAD": _col("PAD"),
+        "FC": _col("FC"),
+        "PAM": _col("PAM"),
+        "PP": _col("PP"),
+        "validada": True,
+        "criterio_validacion": "PAD 40-130; PAS <=230; PP 20-80",
+    })
+
+    # Conservar columnas originales útiles que no estén ya normalizadas.
+    extras = src.copy()
+    for c in list(extras.columns):
+        if c in ["PAS", "PAD", "FC", "PAM", "PP", "Período", "fecha", "hora", "dt", "tplot"]:
+            extras = extras.drop(columns=[c], errors="ignore")
+    if not extras.empty:
+        extras = extras.add_prefix("origen_")
+        out = pd.concat([out, extras], axis=1)
+
     for c in out.columns:
-        if c in ["dt"] or str(out[c].dtype).startswith("datetime"):
+        if c in ["dt", "datetime_medicion"] or str(out[c].dtype).startswith("datetime"):
             out[c] = pd.to_datetime(out[c], errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S")
     return _df_excel_safe(out)
-
 
 def save_study_to_excel_repository(df_clean, m, pat, stu, phenotype, excluded, n_orig, base_name):
     """
     Guarda automáticamente cada MAPA procesado en un Excel acumulativo:
     - Hoja ESTUDIOS: una fila por estudio.
-    - Hoja MEDICIONES_VALIDADAS: una fila por medición validada.
+    - Hoja MEDICIONES_VALIDADAS: una fila por medición validada, con paciente, horario, PAS, PAD y FC.
 
     Corrección crítica:
     El repositorio Excel no debe interrumpir el cálculo ni la generación del PDF.
@@ -2284,7 +2359,7 @@ def save_study_to_excel_repository(df_clean, m, pat, stu, phenotype, excluded, n
     study_id = "MAPA_SIN_ID"
     try:
         study_id, summary = _repo_summary_row(df_clean, m, pat, stu, phenotype, excluded, n_orig, base_name)
-        meas_new = _repo_measurements_df(df_clean, study_id)
+        meas_new = _repo_measurements_df(df_clean, study_id, pat, stu, phenotype)
         summary_new = _df_excel_safe(pd.DataFrame([summary]))
 
         REPO_DIR.mkdir(parents=True, exist_ok=True)
@@ -2314,8 +2389,15 @@ def save_study_to_excel_repository(df_clean, m, pat, stu, phenotype, excluded, n
             studies_all.to_excel(writer, sheet_name="ESTUDIOS", index=False)
             meas_all.to_excel(writer, sheet_name="MEDICIONES_VALIDADAS", index=False)
 
+            schema = pd.DataFrame([
+                {"hoja": "ESTUDIOS", "contenido": "Una fila por MAPA procesado, con promedios, fenotipo, validación y huella del dataset."},
+                {"hoja": "MEDICIONES_VALIDADAS", "contenido": "Una fila por medición validada: paciente, fecha/hora, PAS, PAD, FC, PAM, PP y período."},
+                {"hoja": "README_REPOSITORIO", "contenido": "Archivo .xlsx acumulativo para seguimiento e investigación. Para volúmenes superiores al límite de Excel conviene migrar a SQLite/PostgreSQL."},
+            ])
+            schema.to_excel(writer, sheet_name="README_REPOSITORIO", index=False)
+
             # Ajustes simples de ancho de columnas para que sea legible al abrir.
-            for sheet_name in ["ESTUDIOS", "MEDICIONES_VALIDADAS"]:
+            for sheet_name in ["ESTUDIOS", "MEDICIONES_VALIDADAS", "README_REPOSITORIO"]:
                 ws = writer.book[sheet_name]
                 for col_cells in ws.columns:
                     col_letter = col_cells[0].column_letter
@@ -2373,31 +2455,72 @@ def _noc_segments_plot(df):
     return segs
 
 
-def _fmt_x_index(ax, df):
+
+def _time_span_bounds(x, s, e):
     """
-    Etiquetas del eje X sobre índice secuencial.
-    Muestra horarios reales de medición, evitando espacios vacíos artificiales.
+    Calcula límites visuales de una franja de período en horas transcurridas.
+    Usa puntos medios entre mediciones vecinas para que la banda cubra el intervalo
+    real representado por cada lectura.
+    """
+    x = np.asarray(x, dtype=float)
+    n = len(x)
+    if n == 0:
+        return 0.0, 0.0
+    s = max(0, int(s)); e = min(n - 1, int(e))
+    # Gap típico para extender primera/última lectura.
+    diffs = np.diff(x[np.isfinite(x)])
+    diffs = diffs[diffs > 0]
+    default_half_gap = float(np.median(diffs) / 2.0) if len(diffs) else 0.25
+
+    if s > 0 and np.isfinite(x[s]) and np.isfinite(x[s-1]):
+        left = (x[s-1] + x[s]) / 2.0
+    else:
+        left = x[s] - default_half_gap
+    if e < n - 1 and np.isfinite(x[e]) and np.isfinite(x[e+1]):
+        right = (x[e] + x[e+1]) / 2.0
+    else:
+        right = x[e] + default_half_gap
+    return float(left), float(right)
+
+
+def _fmt_x_time_axis(ax, df):
+    """
+    Etiquetas del eje X en tiempo real transcurrido desde la primera medición.
+    Muestra la hora real de lectura y el período D/N.
     """
     n = len(df)
     if n == 0:
         return
 
-    # Máximo ~14 etiquetas para que no se superpongan.
-    step = max(1, int(np.ceil(n / 14)))
-    ticks = list(range(0, n, step))
-    if (n - 1) not in ticks:
-        ticks.append(n - 1)
+    x = pd.to_numeric(df.get('x_time_hours', pd.Series(np.arange(n))), errors='coerce').to_numpy(dtype=float)
+    if np.isnan(x).all():
+        x = np.arange(n, dtype=float)
 
-    labels = []
-    for i in ticks:
+    # Usar índices equiespaciados para que las etiquetas correspondan a mediciones reales.
+    max_ticks = 14
+    idxs = np.linspace(0, n - 1, num=min(max_ticks, n), dtype=int).tolist()
+    idxs = sorted(set(idxs + [0, n - 1]))
+
+    ticks, labels = [], []
+    for i in idxs:
+        if not np.isfinite(x[i]):
+            continue
         hora = str(df.loc[i, 'hora_label'] if 'hora_label' in df.columns else df.loc[i, 'hora'])[:5]
         per = 'N' if str(df.loc[i, 'Período']) == 'Nocturno' else 'D'
-        labels.append(f"{hora}\n{per}")
+        elapsed = float(x[i])
+        labels.append(f"{hora}\n{elapsed:.1f} h · {per}")
+        ticks.append(elapsed)
 
     ax.set_xticks(ticks)
     ax.set_xticklabels(labels, rotation=0, fontsize=7)
-    ax.set_xlabel('Hora de medición (D=diurno, N=nocturno)', fontsize=9)
+    ax.set_xlabel('Tiempo desde la primera medición hasta la última (horas; D=diurno, N=nocturno)', fontsize=9)
 
+
+def _fmt_x_index(ax, df):
+    """
+    Compatibilidad: ahora usa eje temporal continuo si existe x_time_hours.
+    """
+    return _fmt_x_time_axis(ax, df)
 
 def _fmt_x(ax, df):
     """
@@ -3329,7 +3452,7 @@ def main():
         repo_status = st.session_state.get("generated_repo_status", {})
         if repo_status.get("ok"):
             st.success(
-                f"Repositorio Excel actualizado: {repo_status.get('n_estudios', 0)} estudio(s) y "
+                f"Repositorio Excel .xlsx actualizado: {repo_status.get('n_estudios', 0)} estudio(s) y "
                 f"{repo_status.get('n_mediciones', 0)} medición(es) validadas. ID: {repo_status.get('study_id', '-')}."
             )
             st.download_button(
