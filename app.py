@@ -14,6 +14,7 @@ import numpy as np
 import pdfplumber
 import io, base64, os, re, warnings, hashlib
 from datetime import datetime
+from pathlib import Path
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -68,6 +69,12 @@ MAR_L = MAR_R    = 2 * cm
 MAR_T            = 1.5 * cm
 MAR_B            = 2 * cm
 CONTENT_W        = PAGE_W - MAR_L - MAR_R
+
+# Repositorio automático local de estudios analizados.
+# En Streamlit Cloud el archivo persiste mientras la instancia esté activa;
+# en uso local queda guardado en la carpeta de la app.
+REPO_DIR         = Path("repositorio_mapa")
+REPO_XLSX        = REPO_DIR / "repositorio_mapa_estudios.xlsx"
 
 # Pediatric thresholds 95th pct (AAP 2017 / ESH 2016) – approximate midpoints
 PED_THR = {
@@ -2011,9 +2018,25 @@ def generate_chart(df, m):
 
     fig, ax = plt.subplots(1, 1, figsize=(14, 5.8), dpi=130)
 
-    # Franja nocturna por índices reales, no por horas continuas.
-    for s, e in _noc_segments_index(df):
-        ax.axvspan(s - 0.45, e + 0.45, alpha=0.18, color='#4472C4', zorder=0)
+    # Bandas de fondo por períodos reales de medición.
+    # Se diferencian visualmente DIURNO y NOCTURNO para evitar ambigüedad.
+    for period_name, shade_color, shade_alpha in [
+        ('Diurno', '#FFF2CC', 0.30),
+        ('Nocturno', '#DDEBFF', 0.62),
+    ]:
+        for s, e in _period_segments_index(df, period_name):
+            ax.axvspan(s - 0.50, e + 0.50, alpha=shade_alpha, color=shade_color, zorder=0)
+            ax.axvline(s - 0.50, color='#888888', lw=0.45, alpha=0.35, zorder=1)
+            ax.axvline(e + 0.50, color='#888888', lw=0.45, alpha=0.35, zorder=1)
+            # Etiqueta interna del bloque. get_xaxis_transform usa x en datos e y en eje.
+            if (e - s + 1) >= 3:
+                ax.text(
+                    (s + e) / 2, 0.985, period_name.upper(),
+                    transform=ax.get_xaxis_transform(),
+                    ha='center', va='top', fontsize=7, fontweight='bold',
+                    color=('#1F3864' if period_name == 'Nocturno' else '#7A5A00'),
+                    alpha=0.85, zorder=2
+                )
 
     # Curvas PAS/PAD. Se usa marker para que cada registro sea visible.
     ax.plot(x, df['PAS'].astype(float), color='#1f77b4', lw=1.7, marker='o', ms=4.2,
@@ -2030,10 +2053,12 @@ def generate_chart(df, m):
     ax.step(x, dia_thr, where='mid', color='#ff7f0e', ls=':', lw=1.25, alpha=0.9,
             label='Límite PAD según período')
 
-    noc_patch = mpatches.Patch(color='#4472C4', alpha=0.25, label='Período nocturno')
+    dia_patch = mpatches.Patch(color='#FFF2CC', alpha=0.75, label=f"Período diurno (n={n_dia})")
+    noc_patch = mpatches.Patch(color='#DDEBFF', alpha=0.95, label=f"Período nocturno (n={n_noc})")
     handles, labels = ax.get_legend_handles_labels()
-    ax.legend(handles + [noc_patch], labels + ['Período nocturno'],
-              loc='best', fontsize=8, ncol=3, framealpha=0.9)
+    ax.legend(handles + [dia_patch, noc_patch],
+              labels + [f'Período diurno (n={n_dia})', f'Período nocturno (n={n_noc})'],
+              loc='best', fontsize=8, ncol=3, framealpha=0.92)
 
     ax.set_title('MAPA: mediciones validadas de presión arterial', fontsize=12, fontweight='bold')
     ax.set_ylabel('mmHg', fontsize=10)
@@ -2127,25 +2152,183 @@ def _dataset_fingerprint(df):
     return hashlib.sha256(data).hexdigest()
 
 
-def _noc_segments_index(df):
+def _period_segments_index(df, period_name):
     """
-    Segmentos nocturnos en coordenadas de índice de fila.
+    Segmentos continuos de un período en coordenadas de índice de fila.
     Devuelve pares (inicio_idx, fin_idx) inclusivos.
     """
     segs = []
     in_seg = False
     start = 0
+    target = str(period_name)
     for i, p in enumerate(df['Período'].astype(str).tolist()):
-        is_noc = (p == 'Nocturno')
-        if is_noc and not in_seg:
+        is_target = (p == target)
+        if is_target and not in_seg:
             start = i
             in_seg = True
-        elif not is_noc and in_seg:
+        elif not is_target and in_seg:
             segs.append((start, i - 1))
             in_seg = False
     if in_seg:
         segs.append((start, len(df) - 1))
     return segs
+
+
+def _noc_segments_index(df):
+    """Compatibilidad: segmentos nocturnos en coordenadas de índice de fila."""
+    return _period_segments_index(df, 'Nocturno')
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# REPOSITORIO EXCEL AUTOMÁTICO
+# ─────────────────────────────────────────────────────────────────────────────
+def _excel_safe_value(v):
+    if v is None:
+        return ""
+    try:
+        if isinstance(v, float) and np.isnan(v):
+            return ""
+    except Exception:
+        pass
+    if isinstance(v, (pd.Timestamp, datetime)):
+        return v.strftime("%Y-%m-%d %H:%M:%S")
+    return v
+
+
+def _repo_summary_row(df_clean, m, pat, stu, phenotype, excluded, n_orig, base_name):
+    fp = _dataset_fingerprint(df_clean)
+    study_id = f"MAPA_{fp[:12].upper()}"
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return study_id, {
+        "id_estudio": study_id,
+        "fecha_procesamiento": now,
+        "archivo_base": base_name,
+        "codigo_paciente_hash": hashlib.sha256(str(pat.get('nombre','')).encode('utf-8')).hexdigest()[:12],
+        "paciente": pat.get("nombre", ""),
+        "edad": pat.get("edad", ""),
+        "sexo": pat.get("sexo", ""),
+        "obra_social": pat.get("obra_social", ""),
+        "solicitante": pat.get("solicitante", ""),
+        "motivo": pat.get("motivo", ""),
+        "fecha_estudio": stu.get("fecha", ""),
+        "inicio": stu.get("inicio", ""),
+        "fin": stu.get("fin", ""),
+        "duracion": stu.get("duracion", ""),
+        "dispositivo": stu.get("dispositivo", ""),
+        "manguito": stu.get("manguito", ""),
+        "n_original": int(n_orig) if n_orig is not None else "",
+        "n_validas": int(len(df_clean)),
+        "n_excluidas": int(excluded) if excluded is not None else 0,
+        "pct_validas": stu.get("pct_validas", ""),
+        "n_diurno": int(m.get("n_diurno", 0) or 0),
+        "n_nocturno": int(m.get("n_nocturno", 0) or 0),
+        "fenotipo": phenotype,
+        "PAS_24h": m.get("PAS_24h"),
+        "PAD_24h": m.get("PAD_24h"),
+        "PAS_diurno": m.get("PAS_diurno"),
+        "PAD_diurno": m.get("PAD_diurno"),
+        "PAS_nocturno": m.get("PAS_nocturno"),
+        "PAD_nocturno": m.get("PAD_nocturno"),
+        "PAM_24h": m.get("PAM_24h"),
+        "PP_24h": m.get("PP_24h"),
+        "FC_24h": m.get("FC_24h"),
+        "dip_sys_pct": m.get("dip_sys"),
+        "dip_dia_pct": m.get("dip_dia"),
+        "patron_dipper": m.get("dip_pattern"),
+        "AASI": m.get("aasi"),
+        "AASI_interpretacion": m.get("aasi_interp"),
+        "morning_surge": m.get("morning_surge"),
+        "huella_dataset": fp,
+        "criterio_validacion": "PAD 40-130; PAS <=230; PP 20-80; datos crudos depurados por clean_data()",
+    }
+
+
+def _repo_measurements_df(df_clean, study_id):
+    out = df_clean.copy().reset_index(drop=True)
+    out.insert(0, "id_estudio", study_id)
+    out.insert(1, "fila_validada", np.arange(1, len(out) + 1))
+    out["validada"] = True
+    out["criterio_validacion"] = "PAD 40-130; PAS <=230; PP 20-80"
+    # Excel no maneja bien algunas columnas con Timestamp/NaT mixtas si quedan como objeto.
+    for c in out.columns:
+        if c in ["dt"] or str(out[c].dtype).startswith("datetime"):
+            out[c] = pd.to_datetime(out[c], errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S")
+    return out.applymap(_excel_safe_value)
+
+
+def save_study_to_excel_repository(df_clean, m, pat, stu, phenotype, excluded, n_orig, base_name):
+    """
+    Guarda automáticamente cada MAPA procesado en un Excel acumulativo:
+    - Hoja ESTUDIOS: una fila por estudio.
+    - Hoja MEDICIONES_VALIDADAS: una fila por medición validada.
+    Si se regenera el mismo estudio, reemplaza las filas con la misma huella.
+    """
+    study_id, summary = _repo_summary_row(df_clean, m, pat, stu, phenotype, excluded, n_orig, base_name)
+    meas_new = _repo_measurements_df(df_clean, study_id)
+    summary_new = pd.DataFrame([summary]).applymap(_excel_safe_value)
+
+    try:
+        REPO_DIR.mkdir(parents=True, exist_ok=True)
+
+        if REPO_XLSX.exists():
+            try:
+                studies_old = pd.read_excel(REPO_XLSX, sheet_name="ESTUDIOS")
+            except Exception:
+                studies_old = pd.DataFrame()
+            try:
+                meas_old = pd.read_excel(REPO_XLSX, sheet_name="MEDICIONES_VALIDADAS")
+            except Exception:
+                meas_old = pd.DataFrame()
+        else:
+            studies_old = pd.DataFrame()
+            meas_old = pd.DataFrame()
+
+        if not studies_old.empty and "id_estudio" in studies_old.columns:
+            studies_old = studies_old[studies_old["id_estudio"].astype(str) != study_id]
+        if not meas_old.empty and "id_estudio" in meas_old.columns:
+            meas_old = meas_old[meas_old["id_estudio"].astype(str) != study_id]
+
+        studies_all = pd.concat([studies_old, summary_new], ignore_index=True)
+        meas_all = pd.concat([meas_old, meas_new], ignore_index=True)
+
+        with pd.ExcelWriter(REPO_XLSX, engine="openpyxl") as writer:
+            studies_all.to_excel(writer, sheet_name="ESTUDIOS", index=False)
+            meas_all.to_excel(writer, sheet_name="MEDICIONES_VALIDADAS", index=False)
+
+            # Ajustes simples de ancho de columnas para que sea legible al abrir.
+            for sheet_name in ["ESTUDIOS", "MEDICIONES_VALIDADAS"]:
+                ws = writer.book[sheet_name]
+                for col_cells in ws.columns:
+                    col_letter = col_cells[0].column_letter
+                    max_len = min(42, max(len(str(cell.value)) if cell.value is not None else 0 for cell in col_cells[:60]) + 2)
+                    ws.column_dimensions[col_letter].width = max(10, max_len)
+                ws.freeze_panes = "A2"
+
+        repo_bytes = REPO_XLSX.read_bytes()
+        return {
+            "ok": True,
+            "path": str(REPO_XLSX),
+            "study_id": study_id,
+            "bytes": repo_bytes,
+            "n_estudios": int(len(studies_all)),
+            "n_mediciones": int(len(meas_all)),
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "path": str(REPO_XLSX),
+            "study_id": study_id,
+            "error": str(e),
+        }
+
+
+def get_repository_excel_bytes():
+    try:
+        if REPO_XLSX.exists():
+            return REPO_XLSX.read_bytes()
+    except Exception:
+        pass
+    return None
 
 
 def _noc_segments_plot(df):
@@ -2819,7 +3002,8 @@ def main():
             for k in [
                 "mapa_file_hash", "df_raw", "meta", "raw_text_debug",
                 "parse_error", "generated_pdf_bytes", "generated_csv_bytes",
-                "generated_base_name", "generated_audio_msg", "generated_summary"
+                "generated_base_name", "generated_audio_msg", "generated_summary",
+                "generated_repo_bytes", "generated_repo_status", "generated_repo_study_id"
             ]:
                 st.session_state.pop(k, None)
             parse_mapa_pdf_cached.clear()
@@ -2838,6 +3022,21 @@ def main():
                 st.caption(f"Detalle: {ocr_err}")
             else:
                 st.success("OCR disponible")
+
+        st.markdown("---")
+        st.markdown("**Repositorio Excel automático**")
+        repo_bytes_now = get_repository_excel_bytes()
+        if repo_bytes_now:
+            st.download_button(
+                "Descargar repositorio acumulativo",
+                data=repo_bytes_now,
+                file_name="repositorio_mapa_estudios.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True
+            )
+            st.caption(f"Archivo local: {REPO_XLSX}")
+        else:
+            st.caption("Se creará automáticamente al generar el primer informe.")
 
     st.title("🫀 MAPA – Informe Médico Ambulatorio")
     st.markdown(f"*{DOCTOR_SUBTITLE}*")
@@ -2858,7 +3057,8 @@ def main():
         for k in [
             "df_raw", "meta", "raw_text_debug", "parse_error",
             "generated_pdf_bytes", "generated_csv_bytes",
-            "generated_base_name", "generated_audio_msg", "generated_summary"
+            "generated_base_name", "generated_audio_msg", "generated_summary",
+            "generated_repo_bytes", "generated_repo_status", "generated_repo_study_id"
         ]:
             st.session_state.pop(k, None)
 
@@ -3040,12 +3240,23 @@ def main():
             csv_io = io.StringIO()
             df_clean.to_csv(csv_io, index=False, encoding="utf-8-sig")
 
+            repo_status = save_study_to_excel_repository(
+                df_clean, m, pat_info, stu_info, phenotype, excluded, n_orig, base_name
+            )
+
             audio_msg = f"ESTUDIO MAPA INFORMADO DE {(nombre or 'PACIENTE').upper()}, {fecha_estudio}, {(obra_social or 'SIN OBRA SOCIAL').upper()}"
 
             st.session_state["generated_pdf_bytes"] = pdf_buf.getvalue()
             st.session_state["generated_csv_bytes"] = csv_io.getvalue().encode("utf-8-sig")
             st.session_state["generated_base_name"] = base_name
             st.session_state["generated_audio_msg"] = audio_msg
+            st.session_state["generated_repo_status"] = repo_status
+            if repo_status.get("ok"):
+                st.session_state["generated_repo_bytes"] = repo_status.get("bytes")
+                st.session_state["generated_repo_study_id"] = repo_status.get("study_id")
+            else:
+                st.session_state.pop("generated_repo_bytes", None)
+                st.session_state["generated_repo_study_id"] = repo_status.get("study_id")
             st.session_state["generated_summary"] = {
                 "phenotype": phenotype,
                 "dip_pattern": m.get("dip_pattern", "-"),
@@ -3095,6 +3306,25 @@ def main():
             mime="text/csv",
             use_container_width=True
         )
+
+        repo_status = st.session_state.get("generated_repo_status", {})
+        if repo_status.get("ok"):
+            st.success(
+                f"Repositorio Excel actualizado: {repo_status.get('n_estudios', 0)} estudio(s) y "
+                f"{repo_status.get('n_mediciones', 0)} medición(es) validadas. ID: {repo_status.get('study_id', '-')}."
+            )
+            st.download_button(
+                label="Descargar repositorio Excel acumulativo",
+                data=st.session_state.get("generated_repo_bytes") or get_repository_excel_bytes(),
+                file_name="repositorio_mapa_estudios.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True
+            )
+        elif repo_status:
+            st.warning(
+                "El informe y el CSV se generaron correctamente, pero no se pudo actualizar el repositorio Excel. "
+                f"Detalle: {repo_status.get('error', 'error no especificado')}"
+            )
 
         audio_msg = st.session_state["generated_audio_msg"]
         st.markdown(f"""
