@@ -1779,26 +1779,101 @@ def _extract_meta(text):
 
     return meta
 
-def assign_periods(df, noc_start=23, noc_end=7):
+def assign_periods(df, noc_start=23, noc_end=7, diurno_desde_primera=True):
+    """
+    Asigna período Diurno/Nocturno.
+
+    Corrección para MAPA:
+    - Si la tabla original NO trae una etiqueta confiable de período, el período
+      diurno se considera desde la primera medición válida del estudio.
+    - El eje temporal se reconstruye en orden de lectura, con cruce de medianoche.
+    - El período nocturno comienza en noc_start y finaliza en noc_end.
+    - Si la tabla original ya trae "Día/Diurno" o "Noche/Nocturno", se respeta.
+    """
     df = df.copy()
-    def _period_from_time(h):
-        mins = time_to_minutes(h)
-        if mins is None:
+
+    def _period_from_clock_min(mins):
+        if mins is None or pd.isna(mins):
             return 'Diurno'
-        hr = mins // 60
-        return 'Nocturno' if (hr >= noc_start or hr < noc_end) else 'Diurno'
+        hr = int(mins) // 60
+        return 'Nocturno' if (hr >= int(noc_start) or hr < int(noc_end)) else 'Diurno'
+
+    def _absolute_minutes_from_hora(horas):
+        vals = []
+        offset = 0
+        prev = None
+        for h in horas:
+            m = time_to_minutes(h)
+            if m is None:
+                vals.append(np.nan)
+                continue
+            m2 = float(m) + offset
+            if prev is not None and m2 < prev - 360:
+                offset += 1440
+                m2 = float(m) + offset
+            vals.append(m2)
+            prev = m2
+        return pd.Series(vals, index=df.index, dtype='float64')
+
+    def _periods_from_first_measurement():
+        if 'hora' not in df.columns or len(df) == 0:
+            return pd.Series(['Diurno'] * len(df), index=df.index)
+
+        abs_min = _absolute_minutes_from_hora(df['hora'])
+        clock_min = df['hora'].apply(time_to_minutes)
+        out = pd.Series(index=df.index, dtype='object')
+
+        valid = abs_min.dropna()
+        if valid.empty:
+            return df['hora'].apply(lambda h: _period_from_clock_min(time_to_minutes(h)))
+
+        first_idx = valid.index[0]
+        first_clock = time_to_minutes(df.loc[first_idx, 'hora'])
+
+        # Por indicación operativa: cuando no hay etiqueta Día/Noche en la
+        # tabla original, el período diurno comienza SIEMPRE en la primera
+        # medición válida y finaliza al primer inicio nocturno posterior.
+        if first_clock is not None and diurno_desde_primera:
+            first_abs = float(abs_min.loc[first_idx])
+            # Primer inicio nocturno posterior a la primera lectura.
+            noc_start_clock = int(noc_start) * 60
+            delta_to_noc = (noc_start_clock - first_clock) % 1440
+            if delta_to_noc == 0:
+                first_noc_start_abs = first_abs
+            else:
+                first_noc_start_abs = first_abs + delta_to_noc
+
+            for idx, a in abs_min.items():
+                if pd.isna(a):
+                    out.loc[idx] = 'Diurno'
+                    continue
+                rel = (float(a) - first_noc_start_abs) % 1440
+                # Desde primera medición hasta el primer inicio nocturno = Diurno.
+                if float(a) < first_noc_start_abs:
+                    out.loc[idx] = 'Diurno'
+                # Entre inicio nocturno y fin nocturno = Nocturno.
+                elif 0 <= rel < ((int(noc_end) * 60 - int(noc_start) * 60) % 1440):
+                    out.loc[idx] = 'Nocturno'
+                else:
+                    out.loc[idx] = 'Diurno'
+            return out
+
+        # Respaldo si la hora inicial no pudo interpretarse.
+        return clock_min.apply(_period_from_clock_min)
+
+    calc_periods = _periods_from_first_measurement()
 
     if 'Período' not in df.columns:
-        df['Período'] = df['hora'].apply(_period_from_time)
+        df['Período'] = calc_periods
         df['periodo_asumido'] = True
     else:
         def norm_period(row):
-            val = str(row.get('Período', '')).lower()
+            val = str(row.get('Período', '')).lower().strip()
             if 'noch' in val or 'noct' in val:
                 return 'Nocturno'
-            if 'dia' in val or 'diur' in val:
+            if 'dia' in val or 'diur' in val or 'día' in val:
                 return 'Diurno'
-            return _period_from_time(row.get('hora'))
+            return calc_periods.loc[row.name] if row.name in calc_periods.index else 'Diurno'
         df['Período'] = df.apply(norm_period, axis=1)
         df['periodo_asumido'] = False
     return df
@@ -2120,21 +2195,17 @@ def _prepare_df_for_chart(df):
         out['tplot'] = pd.to_numeric(out['tplot'], errors='coerce')
         out = out.sort_values('tplot').reset_index(drop=True)
 
-    def _period_from_time_for_chart(h):
-        mins = time_to_minutes(h)
-        if mins is None:
-            return 'Diurno'
-        hr = mins // 60
-        return 'Nocturno' if (hr >= 23 or hr < 7) else 'Diurno'
-
-    if 'Período' not in out.columns:
-        out['Período'] = out['hora'].apply(_period_from_time_for_chart)
+    # No recalcular de forma rígida 23-7 si la tabla ya fue clasificada en main().
+    # Sólo completar períodos faltantes usando la misma lógica de diurno desde
+    # la primera medición.
+    if 'Período' not in out.columns or out['Período'].isna().all():
+        out = assign_periods(out, diurno_desde_primera=True)
     else:
         per = out['Período'].astype(str).str.strip().str.lower()
-        calc = out['hora'].apply(_period_from_time_for_chart)
+        calc = assign_periods(out.drop(columns=['Período'], errors='ignore'), diurno_desde_primera=True)['Período']
         out['Período'] = np.where(
             per.str.contains('noch|noct', regex=True), 'Nocturno',
-            np.where(per.str.contains('dia|diur', regex=True), 'Diurno', calc)
+            np.where(per.str.contains('dia|diur|día', regex=True), 'Diurno', calc)
         )
 
     if 'tplot' in out.columns and out['tplot'].notna().any():
@@ -3138,13 +3209,14 @@ def main():
         st.markdown("**Período nocturno para filas sin etiqueta**")
         noc_start = st.number_input("Inicio nocturno (hs)", 20, 24, 23, 1)
         noc_end   = st.number_input("Fin nocturno (hs)", 4, 10, 7, 1)
+        st.caption("Si la tabla no trae Día/Noche, el período diurno se inicia en la primera medición válida del estudio.")
         st.markdown("---")
 
         if st.button("♻️ Reprocesar PDF / limpiar caché", use_container_width=True):
             for k in [
                 "mapa_file_hash", "df_raw", "meta", "raw_text_debug",
-                "parse_error", "generated_pdf_bytes", "generated_csv_bytes",
-                "generated_base_name", "generated_audio_msg", "generated_summary",
+                "parse_error", "generated_pdf_bytes", "generated_csv_bytes", "generated_chart_bytes",
+                "generated_chart_error", "generated_base_name", "generated_audio_msg", "generated_summary",
                 "generated_repo_bytes", "generated_repo_status", "generated_repo_study_id"
             ]:
                 st.session_state.pop(k, None)
@@ -3374,6 +3446,16 @@ def main():
             pdf_buf = generate_pdf(df_clean, m, pat_info, stu_info, phenotype,
                                    logo_bytes, firma_bytes, excluded)
 
+            # Vista previa del gráfico en la app web. Se genera desde las mismas
+            # lecturas depuradas usadas para cálculos, PDF y repositorio Excel.
+            chart_preview_bytes = None
+            chart_preview_error = ""
+            try:
+                chart_preview = generate_chart(df_clean, m)
+                chart_preview_bytes = chart_preview.getvalue()
+            except Exception as e:
+                chart_preview_error = str(e)
+
             nombre_clean = re.sub(r"[^A-Za-z0-9]", "_", (nombre or "Paciente").upper())
             fecha_clean = str(fecha_estudio).replace("/", "-")
             os_clean = re.sub(r"[^A-Za-z0-9]", "_", (obra_social or "SinOS").upper())
@@ -3390,6 +3472,8 @@ def main():
 
             st.session_state["generated_pdf_bytes"] = pdf_buf.getvalue()
             st.session_state["generated_csv_bytes"] = csv_io.getvalue().encode("utf-8-sig")
+            st.session_state["generated_chart_bytes"] = chart_preview_bytes
+            st.session_state["generated_chart_error"] = chart_preview_error
             st.session_state["generated_base_name"] = base_name
             st.session_state["generated_audio_msg"] = audio_msg
             st.session_state["generated_repo_status"] = repo_status
@@ -3432,6 +3516,18 @@ def main():
 
         if summary.get("excluded", 0) > 0:
             st.info(f"{summary.get('excluded')} medición(es) fueron excluidas durante la depuración de datos.")
+
+        st.markdown("### Gráfico MAPA en tiempo real")
+        chart_bytes = st.session_state.get("generated_chart_bytes")
+        if chart_bytes:
+            st.image(
+                chart_bytes,
+                caption="Eje X: tiempo transcurrido desde la primera medición hasta la última. El período diurno comienza en la primera medición válida del estudio cuando la tabla no trae una etiqueta Día/Noche confiable.",
+                use_container_width=True
+            )
+        else:
+            err = st.session_state.get("generated_chart_error", "no especificado")
+            st.warning(f"No se pudo mostrar el gráfico en pantalla. Detalle: {err}")
 
         base_name = st.session_state["generated_base_name"]
         st.download_button(
