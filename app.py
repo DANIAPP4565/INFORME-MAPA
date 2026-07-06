@@ -2,7 +2,7 @@
 """
 MAPA Informe Médico – App Streamlit
 Dr. Ricardo Daniel Olano | Cardiólogo – IPENSA La Plata
-Versión 6.6 – 2026
+Versión 6.7 – 2026
 """
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -538,7 +538,7 @@ def _generated_report_error(full_text):
 
 
 @st.cache_data(show_spinner=False, ttl=3600, max_entries=8)
-def parse_mapa_pdf_cached(file_bytes, cache_version="v6.6-night-clock-ocr3-qc"):
+def parse_mapa_pdf_cached(file_bytes, cache_version="v6.7-gridless-table-ocr-qc"):
     """
     Versión cacheada del parser pesado. Evita re-ejecutar OCR y parsers
     en cada rerun de Streamlit. El cache se invalida automáticamente si
@@ -1059,110 +1059,154 @@ def _numeric_candidates_from_cell(txt, low, high):
     return sorted(cands)
 
 
+def _explicit_numeric_candidates(txt, low, high):
+    """
+    Extrae primero números que aparecen explícitamente en la celda OCR.
+    Se preserva el orden de aparición para priorizar una lectura clara
+    por encima de variantes generadas al corregir ruido OCR.
+    """
+    vals = []
+    for m in re.finditer(r"(?<!\d)(\d{1,3})(?!\d)", str(txt or "")):
+        try:
+            v = int(m.group(1))
+        except Exception:
+            continue
+        if low <= v <= high and v not in vals:
+            vals.append(v)
+    return vals
+
+
+def _ordered_numeric_candidates(txt, low, high):
+    """
+    Combina números explícitos y candidatos corregidos por OCR, manteniendo
+    primero las lecturas explícitas.
+    """
+    explicit = _explicit_numeric_candidates(txt, low, high)
+    inferred = _numeric_candidates_from_cell(txt, low, high)
+    return explicit + [v for v in inferred if v not in explicit]
+
+
 def _choose_plausible_row_from_cells(cells, reference_year=None):
     """
-    Interpreta una fila de Tabla Completa leída por OCR/layout.
-    A diferencia de la versión original, no exige que todas las celdas estén
-    perfectas: si PAD o PP salen ilegibles, los infiere desde PAS, PAM y PP.
-    Esto evita perder filas cuando Tesseract lee 71 como '|__|' o 64 como 'fea'.
+    Interpreta una fila de Tabla Completa MedicalDB a partir de celdas OCR.
+
+    Cambios v6.7:
+    - prioriza números explícitos antes de variantes OCR;
+    - usa la redundancia PAS/PAD/PAM/PP para resolver celdas pegadas;
+    - NO penaliza valores verdaderamente atípicos, porque la depuración clínica
+      se realiza después. Esto evita "corregir" un outlier real y convertirlo
+      en una lectura falsa;
+    - deriva PAS o PAD sólo cuando esa columna quedó vacía.
     """
     if len(cells) < 7:
         return None
 
     joined = " ".join(str(x) for x in cells)
+
     # Evitar encabezados.
-    if re.search(r"fecha|hora|sis|dia|pam|comentario", joined, re.I):
+    if re.search(r"fecha|hora|hoia|sis|dia|dla|pam|comentario", joined, re.I):
         return None
 
-    nro_c = _numeric_candidates_from_cell(cells[0] if len(cells) > 0 else "", 1, 300)
-    fecha = _normalize_date_token(cells[1] if len(cells) > 1 else "", reference_year=reference_year)
+    nro_c = _ordered_numeric_candidates(cells[0] if len(cells) > 0 else "", 1, 300)
+    fecha = _normalize_date_token(
+        cells[1] if len(cells) > 1 else "",
+        reference_year=reference_year
+    )
     hora = _normalize_time_token(cells[2] if len(cells) > 2 else "")
     if not hora:
         return None
 
-    pas_c = _numeric_candidates_from_cell(cells[3] if len(cells) > 3 else "", 55, 260)
-    pad_c = _numeric_candidates_from_cell(cells[4] if len(cells) > 4 else "", 25, 150)
-    fc_c  = _numeric_candidates_from_cell(cells[5] if len(cells) > 5 else "", 30, 190)
-    pam_c = _numeric_candidates_from_cell(cells[6] if len(cells) > 6 else "", 40, 180)
-    pp_c  = _numeric_candidates_from_cell(cells[7] if len(cells) > 7 else "", 5, 180)
+    pas_c = _ordered_numeric_candidates(cells[3] if len(cells) > 3 else "", 55, 260)
+    pad_c = _ordered_numeric_candidates(cells[4] if len(cells) > 4 else "", 25, 150)
+    fc_c  = _ordered_numeric_candidates(cells[5] if len(cells) > 5 else "", 30, 190)
+    pam_c = _ordered_numeric_candidates(cells[6] if len(cells) > 6 else "", 40, 180)
+    pp_c  = _ordered_numeric_candidates(cells[7] if len(cells) > 7 else "", 5, 180)
 
-    # Candidatos por relación fisiológica.
-    # PP = PAS - PAD ; PAM ~= (PAS + 2*PAD) / 3
-    pas_aug, pad_aug, pp_aug, pam_aug = set(pas_c), set(pad_c), set(pp_c), set(pam_c)
+    # Derivar PAS sólo si la celda PAS quedó sin candidatos.
+    if not pas_c:
+        derived = []
+        for pad in pad_c:
+            for pp in pp_c:
+                v = pad + pp
+                if 55 <= v <= 260:
+                    v = int(round(v))
+                    if v not in derived:
+                        derived.append(v)
+            for pam in pam_c:
+                v = 3 * pam - 2 * pad
+                if 55 <= v <= 260:
+                    v = int(round(v))
+                    if v not in derived:
+                        derived.append(v)
+        pas_c = derived
 
-    for pas in list(pas_aug):
-        for pp in list(pp_aug):
-            pad = pas - pp
-            if 25 <= pad <= 150:
-                pad_aug.add(int(round(pad)))
-        for pam in list(pam_aug):
-            pad = (3*pam - pas) / 2
-            if 25 <= pad <= 150:
-                pad_aug.add(int(round(pad)))
+    # Derivar PAD sólo si la celda PAD quedó sin candidatos.
+    if not pad_c:
+        derived = []
+        for pas in pas_c:
+            for pp in pp_c:
+                v = pas - pp
+                if 25 <= v <= 150:
+                    v = int(round(v))
+                    if v not in derived:
+                        derived.append(v)
+            for pam in pam_c:
+                v = (3 * pam - pas) / 2
+                if 25 <= v <= 150:
+                    v = int(round(v))
+                    if v not in derived:
+                        derived.append(v)
+        pad_c = derived
 
-    for pad in list(pad_aug):
-        for pp in list(pp_aug):
-            pas = pad + pp
-            if 55 <= pas <= 260:
-                pas_aug.add(int(round(pas)))
-        for pam in list(pam_aug):
-            pas = 3*pam - 2*pad
-            if 55 <= pas <= 260:
-                pas_aug.add(int(round(pas)))
+    if not pas_c or not pad_c:
+        return None
 
-    for pas in list(pas_aug):
-        for pad in list(pad_aug):
-            if pas > pad:
-                pp = pas - pad
-                if 5 <= pp <= 180:
-                    pp_aug.add(int(round(pp)))
-                pam = (pas + 2*pad) / 3
-                if 40 <= pam <= 180:
-                    pam_aug.add(int(round(pam)))
-
-    pas_list = sorted(pas_aug)[:30]
-    pad_list = sorted(pad_aug)[:30]
-    fc_list  = sorted(fc_c)[:20] or [np.nan]
-    pam_list = sorted(pam_aug)[:30] or [np.nan]
-    pp_list  = sorted(pp_aug)[:30] or [np.nan]
+    fc_list = fc_c or [np.nan]
+    pam_list = pam_c or [np.nan]
+    pp_list = pp_c or [np.nan]
 
     best = None
-    for pas in pas_list:
-        for pad in pad_list:
-            if not (55 <= pas <= 260 and 25 <= pad <= 150 and pas > pad):
+
+    for pas in pas_c:
+        for pad in pad_c:
+            if pas <= pad:
                 continue
+
             calc_pp = pas - pad
-            calc_pam = (pas + 2*pad) / 3
+            calc_pam = (pas + 2 * pad) / 3.0
+
             for fc in fc_list:
                 for pam in pam_list:
-                    if pd.isna(pam):
-                        pam = round(calc_pam)
+                    pam_use = calc_pam if pd.isna(pam) else float(pam)
+
                     for pp in pp_list:
-                        if pd.isna(pp):
-                            pp = calc_pp
+                        pp_use = calc_pp if pd.isna(pp) else float(pp)
 
-                        # Penalización por incoherencia. No se descarta por PP fuera de rango
-                        # porque después clean_data aplica los criterios obligatorios.
+                        # Coherencia fisiológica/algebraica entre columnas redundantes.
                         score = 0.0
-                        score += abs(float(pp) - calc_pp) * 2.5
-                        score += abs(float(pam) - calc_pam) * 1.8
+                        score += abs(pp_use - calc_pp) * 2.5
+                        score += abs(pam_use - calc_pam) * 1.8
 
-                        # Preferir valores que salieron directamente de su celda.
-                        if pas not in pas_c: score += 8
-                        if pad not in pad_c: score += 10
-                        if not pd.isna(fc) and fc not in fc_c: score += 4
-                        if pam_c and pam not in pam_c: score += 4
-                        if pp_c and pp not in pp_c: score += 4
+                        # Penalización leve por alejarse de los primeros candidatos OCR.
+                        score += 0.10 * pas_c.index(pas)
+                        score += 0.10 * pad_c.index(pad)
+                        score += 0.03 * pam_list.index(pam)
+                        score += 0.03 * pp_list.index(pp)
 
-                        # Penalizar fisiológicamente raro, pero permitir para depuración posterior.
-                        if pas > 230 or pad > 130 or pp < 10 or pp > 120:
-                            score += 15
-                        if calc_pp < 8:
-                            score += 40
+                        # Sólo relaciones imposibles. No penalizar outliers reales:
+                        # esos se eliminan después mediante clean_data().
+                        if calc_pp < 1:
+                            score += 100.0
 
-                        cand = (score, int(round(pas)), int(round(pad)),
-                                float(fc) if not pd.isna(fc) else np.nan,
-                                int(round(pam)), int(round(pp)))
+                        cand = (
+                            score,
+                            int(round(pas)),
+                            int(round(pad)),
+                            float(fc) if not pd.isna(fc) else np.nan,
+                            int(round(pam_use)),
+                            int(round(pp_use)),
+                        )
+
                         if best is None or cand[0] < best[0]:
                             best = cand
 
@@ -1170,7 +1214,6 @@ def _choose_plausible_row_from_cells(cells, reference_year=None):
         return None
 
     score, pas, pad, fc, pam, pp = best
-    # Umbral de score suficientemente amplio para OCR ruidoso pero no para filas basura.
     if score > 75:
         return None
 
@@ -1184,15 +1227,28 @@ def _choose_plausible_row_from_cells(cells, reference_year=None):
         "PAM": pam,
         "PP": pp,
         "Período": "Nocturno" if re.search(r"noche|noct", joined, re.I) else "",
-        "motivo": joined.strip()
+        "motivo": joined.strip(),
     }
 
 
 def _ocr_medicaldb_table_layout(pdf_file, dpi=170, last_pages=OCR_TABLE_LAST_PAGES):
     """
-    OCR por grilla de las páginas finales de la Tabla Completa MedicalDB.
-    Optimizado para velocidad: detecta la grilla, recorta SOLO la tabla y ejecuta
-    Tesseract con timeout por página. No recorre páginas sin tabla.
+    OCR robusto de la Tabla Completa MedicalDB.
+
+    Estrategia v6.7:
+    1. Detecta la grilla física.
+    2. Identifica el tramo regular de filas de la tabla.
+    3. Elimina visualmente las líneas de la grilla antes del OCR.
+       Esta corrección es crítica: Tesseract tendía a pegar PAS/PAD/FC o a
+       perder filas completas cuando las líneas quedaban visibles.
+    4. Ejecuta OCR por página con PSM 6 y reasigna cada palabra a su celda
+       usando las coordenadas originales de la grilla.
+    5. Si una fila no se recupera, intenta una segunda pasada binarizada.
+    6. Conserva outliers reales; la depuración clínica se hace después.
+
+    En el estudio de referencia CARATI, la Tabla Completa contiene 76 filas
+    listadas aunque el resumen del equipo informa 77 válidas. Esta función
+    recupera las filas físicas de la tabla sin inventar una lectura 77.
     """
     try:
         import fitz
@@ -1202,12 +1258,12 @@ def _ocr_medicaldb_table_layout(pdf_file, dpi=170, last_pages=OCR_TABLE_LAST_PAG
         import numpy as _np
         requerir_tesseract()
     except Exception as e:
-        raise RuntimeError(f"OCR de tabla por celdas no disponible: {e}")
+        raise RuntimeError(f"OCR de tabla por grilla no disponible: {e}")
 
     pdf_file.seek(0)
     data = pdf_file.read()
     doc = fitz.open(stream=data, filetype="pdf")
-    mat = fitz.Matrix(dpi/72.0, dpi/72.0)
+    mat = fitz.Matrix(dpi / 72.0, dpi / 72.0)
 
     try:
         ref_text = _ocr_metadata_pages(io.BytesIO(data), dpi=150, max_pages=3)
@@ -1216,121 +1272,293 @@ def _ocr_medicaldb_table_layout(pdf_file, dpi=170, last_pages=OCR_TABLE_LAST_PAG
     ref_year = _study_reference_year(ref_text)
 
     all_rows = []
-    start_page = max(0, len(doc) - int(last_pages or 2))
+    start_page = max(0, len(doc) - int(last_pages or OCR_TABLE_LAST_PAGES))
+
+    def _build_cell_text(ocr_img, xs_abs, ys_abs, x0, y0, psm=6, timeout=8):
+        """OCR de una imagen sin grilla y reasignación geométrica a celdas."""
+        try:
+            d = pytesseract.image_to_data(
+                ocr_img,
+                lang="eng",
+                config=f"--oem 3 --psm {psm}",
+                output_type=Output.DICT,
+                timeout=timeout,
+            )
+        except Exception:
+            d = pytesseract.image_to_data(
+                ocr_img,
+                config=f"--oem 3 --psm {psm}",
+                output_type=Output.DICT,
+                timeout=timeout,
+            )
+
+        rxs = [x - x0 for x in xs_abs]
+        rys = [y - y0 for y in ys_abs]
+
+        cells = [
+            [[] for _ in range(len(rxs) - 1)]
+            for __ in range(len(rys) - 1)
+        ]
+
+        for i, word in enumerate(d.get("text", [])):
+            word = str(word).strip()
+            if not word:
+                continue
+
+            cx = d["left"][i] + d["width"][i] / 2.0
+            cy = d["top"][i] + d["height"][i] / 2.0
+
+            ci = next(
+                (j for j in range(len(rxs) - 1) if rxs[j] <= cx <= rxs[j + 1]),
+                None,
+            )
+            ri = next(
+                (j for j in range(len(rys) - 1) if rys[j] <= cy <= rys[j + 1]),
+                None,
+            )
+
+            if ci is not None and ri is not None:
+                cells[ri][ci].append(word)
+
+        return [[" ".join(x) for x in row] for row in cells]
 
     for pno in range(start_page, len(doc)):
         page = doc[pno]
         pix = page.get_pixmap(matrix=mat, alpha=False)
-        img = _np.frombuffer(pix.samples, dtype=_np.uint8).reshape(pix.height, pix.width, pix.n)
+
+        img = _np.frombuffer(
+            pix.samples,
+            dtype=_np.uint8
+        ).reshape(pix.height, pix.width, pix.n)
+
         if pix.n == 4:
             img = cv2.cvtColor(img, cv2.COLOR_RGBA2RGB)
+
         gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
         h, w = gray.shape
 
-        bin_img = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
-                                        cv2.THRESH_BINARY_INV, 31, 15)
-        v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(18, h//85)))
-        h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(18, w//85), 1))
-        vert = cv2.morphologyEx(bin_img, cv2.MORPH_OPEN, v_kernel, iterations=1)
-        hor  = cv2.morphologyEx(bin_img, cv2.MORPH_OPEN, h_kernel, iterations=1)
+        bin_img = cv2.adaptiveThreshold(
+            gray,
+            255,
+            cv2.ADAPTIVE_THRESH_MEAN_C,
+            cv2.THRESH_BINARY_INV,
+            31,
+            15,
+        )
+
+        v_kernel = cv2.getStructuringElement(
+            cv2.MORPH_RECT,
+            (1, max(18, h // 85)),
+        )
+        h_kernel = cv2.getStructuringElement(
+            cv2.MORPH_RECT,
+            (max(18, w // 85), 1),
+        )
+
+        vert = cv2.morphologyEx(
+            bin_img,
+            cv2.MORPH_OPEN,
+            v_kernel,
+            iterations=1,
+        )
+        hor = cv2.morphologyEx(
+            bin_img,
+            cv2.MORPH_OPEN,
+            h_kernel,
+            iterations=1,
+        )
 
         xs, ys = [], []
-        contours, _ = cv2.findContours(vert, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        for c in contours:
-            x, y, ww, hh = cv2.boundingRect(c)
-            if hh > h*0.16 and ww < max(25, w*0.015):
-                xs.append(x + ww//2)
-        contours, _ = cv2.findContours(hor, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        for c in contours:
-            x, y, ww, hh = cv2.boundingRect(c)
-            if ww > w*0.45 and hh < max(25, h*0.01):
-                ys.append(y + hh//2)
 
-        xs = _merge_positions(xs, max(6, int(w*0.006)))
-        ys = _merge_positions(ys, max(6, int(h*0.004)))
+        contours, _ = cv2.findContours(
+            vert,
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE,
+        )
+        for c in contours:
+            x, y, ww, hh = cv2.boundingRect(c)
+            if hh > h * 0.16 and ww < max(25, w * 0.015):
+                xs.append(x + ww // 2)
+
+        contours, _ = cv2.findContours(
+            hor,
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE,
+        )
+        for c in contours:
+            x, y, ww, hh = cv2.boundingRect(c)
+            if ww > w * 0.45 and hh < max(25, h * 0.01):
+                ys.append(y + hh // 2)
+
+        xs = _merge_positions(xs, max(6, int(w * 0.006)))
+        ys = _merge_positions(ys, max(6, int(h * 0.004)))
+
         if len(xs) < 8 or len(ys) < 8:
             continue
 
-        # Recorte de la grilla, con margen mínimo.
-        x0, x1 = max(0, xs[0]-8), min(w, xs[-1]+8)
-        y0, y1 = max(0, ys[0]-8), min(h, ys[-1]+8)
-        crop = gray[y0:y1, x0:x1]
-
-        # Coordenadas de grilla relativas al recorte.
-        rxs = [x - x0 for x in xs]
-        rys = [y - y0 for y in ys]
-
-        # OCR de la tabla recortada. English suele ser más rápido y suficiente para números/Noche.
-        try:
-            data_ocr = pytesseract.image_to_data(
-                crop,
-                lang="eng",
-                config="--oem 3 --psm 6",
-                output_type=Output.DICT,
-                timeout=7
-            )
-        except RuntimeError:
+        # Encontrar el tramo horizontal más largo con separación regular.
+        # Así se excluyen automáticamente la línea del encabezado de página
+        # y la línea del pie, que antes contaminaban la grilla.
+        gaps = _np.diff(ys)
+        small_gaps = [
+            float(g)
+            for g in gaps
+            if 8 <= g <= max(20, int(h * 0.05))
+        ]
+        if not small_gaps:
             continue
-        except Exception:
-            try:
-                data_ocr = pytesseract.image_to_data(
-                    crop,
-                    config="--oem 3 --psm 6",
-                    output_type=Output.DICT,
-                    timeout=7
-                )
-            except Exception:
-                continue
 
-        cells = [[[] for _ in range(len(rxs)-1)] for __ in range(len(rys)-1)]
-        for i, word in enumerate(data_ocr.get("text", [])):
-            word = str(word).strip()
-            if not word:
-                continue
+        med_gap = float(_np.median(small_gaps))
+        runs = []
+        run_start = None
+
+        for i, g in enumerate(gaps):
+            regular = (0.55 * med_gap) <= g <= (1.80 * med_gap)
+
+            if regular and run_start is None:
+                run_start = i
+
+            if (not regular or i == len(gaps) - 1) and run_start is not None:
+                run_end = i if not regular else i + 1
+                runs.append((run_start, run_end))
+                run_start = None
+
+        if not runs:
+            continue
+
+        r0, r1 = max(runs, key=lambda z: z[1] - z[0])
+        table_ys = ys[r0:r1 + 1]
+
+        if len(table_ys) < 8:
+            continue
+
+        # La Tabla Completa ocupa el ancho entre la primera y última línea vertical.
+        x0, x1 = xs[0], xs[-1]
+        y0, y1 = table_ys[0], table_ys[-1]
+
+        if x1 <= x0 or y1 <= y0:
+            continue
+
+        crop = gray[y0:y1, x0:x1].copy()
+
+        # Eliminar las líneas físicas de la grilla antes del OCR.
+        grid_mask = cv2.bitwise_or(
+            vert[y0:y1, x0:x1],
+            hor[y0:y1, x0:x1],
+        )
+        grid_mask = cv2.dilate(
+            grid_mask,
+            _np.ones((2, 2), dtype=_np.uint8),
+            iterations=1,
+        )
+
+        clean = crop.copy()
+        clean[grid_mask > 0] = 255
+
+        # Primera pasada: imagen limpia en gris.
+        passes = []
+        try:
+            passes.append(
+                _build_cell_text(
+                    clean,
+                    xs,
+                    table_ys,
+                    x0,
+                    y0,
+                    psm=6,
+                    timeout=8,
+                )
+            )
+        except Exception:
+            pass
+
+        if not passes:
+            continue
+
+        # Parsear la primera pasada.
+        by_row = {}
+        for ri, row in enumerate(passes[0]):
+            parsed = _choose_plausible_row_from_cells(
+                row,
+                reference_year=ref_year,
+            )
+            if parsed and parsed.get("fecha") and parsed.get("hora"):
+                by_row[ri] = parsed
+
+        # Si la recuperación quedó claramente incompleta, segunda pasada
+        # binarizada y relleno sólo de filas faltantes.
+        physical_data_rows = max(0, len(table_ys) - 2)  # descuenta encabezado
+        need_retry = (
+            physical_data_rows > 0
+            and len(by_row) < int(_np.ceil(physical_data_rows * 0.95))
+        )
+
+        if need_retry:
             try:
-                if float(data_ocr.get("conf", [0])[i]) < -1:
-                    continue
+                binary_clean = cv2.threshold(
+                    clean,
+                    0,
+                    255,
+                    cv2.THRESH_BINARY + cv2.THRESH_OTSU,
+                )[1]
+
+                retry_cells = _build_cell_text(
+                    binary_clean,
+                    xs,
+                    table_ys,
+                    x0,
+                    y0,
+                    psm=6,
+                    timeout=8,
+                )
+
+                for ri, row in enumerate(retry_cells):
+                    if ri in by_row:
+                        continue
+
+                    parsed = _choose_plausible_row_from_cells(
+                        row,
+                        reference_year=ref_year,
+                    )
+                    if parsed and parsed.get("fecha") and parsed.get("hora"):
+                        by_row[ri] = parsed
             except Exception:
                 pass
-            cx = data_ocr["left"][i] + data_ocr["width"][i] / 2
-            cy = data_ocr["top"][i] + data_ocr["height"][i] / 2
-            ci = next((j for j in range(len(rxs)-1) if rxs[j] <= cx <= rxs[j+1]), None)
-            ri = next((j for j in range(len(rys)-1) if rys[j] <= cy <= rys[j+1]), None)
-            if ci is not None and ri is not None:
-                cells[ri][ci].append(word)
 
-        cell_text = [[" ".join(x) for x in row] for row in cells]
-
-        header_i = None
-        for i, row in enumerate(cell_text):
-            joined = " ".join(row[:10]).lower()
-            if ("fecha" in joined and "hora" in joined) or ("sis" in joined and ("dia" in joined or "dla" in joined)):
-                header_i = i
-                break
-        if header_i is None:
-            # En algunos OCR el encabezado queda ilegible; asumir primera fila después del título.
-            header_i = 1 if len(cell_text) > 3 else 0
-
-        page_rows = []
-        for row in cell_text[header_i+1:]:
-            parsed = _choose_plausible_row_from_cells(row, reference_year=ref_year)
-            if parsed:
-                parsed["nro"] = len(all_rows) + len(page_rows) + 1
-                page_rows.append(parsed)
-
-        if len(page_rows) >= 2:
-            all_rows.extend(page_rows)
+        # Conservar el orden físico de la tabla.
+        for ri in sorted(by_row):
+            parsed = dict(by_row[ri])
+            parsed["_ocr_page"] = pno + 1
+            parsed["_ocr_row"] = ri
+            all_rows.append(parsed)
 
     if not all_rows:
         return None
+
     df = pd.DataFrame(all_rows)
-    subset = [c for c in ["hora","PAS","PAD","PAM","PP"] if c in df.columns]
+
+    for c in ["PAS", "PAD", "FC", "PAM", "PP"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    df = df.dropna(subset=["PAS", "PAD"])
+
+    # Deduplicación conservadora: una misma lectura puede reaparecer sólo si
+    # dos pasadas OCR la recuperaron; no borrar por nro aislado.
+    subset = [
+        c for c in ["fecha", "hora", "PAS", "PAD"]
+        if c in df.columns
+    ]
     if subset:
         df = df.drop_duplicates(subset=subset, keep="first")
-    for c in ["PAS","PAD","FC","PAM","PP"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    df = df.dropna(subset=["PAS","PAD"])
-    return df if len(df) >= 10 else None
+
+    # Columnas técnicas sólo para depuración interna.
+    df = df.drop(
+        columns=["_ocr_page", "_ocr_row"],
+        errors="ignore",
+    )
+
+    return df.reset_index(drop=True) if len(df) >= 10 else None
 
 def _extract_ints_after(text):
     vals = []
