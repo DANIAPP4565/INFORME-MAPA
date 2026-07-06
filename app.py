@@ -2,7 +2,7 @@
 """
 MAPA Informe Médico – App Streamlit
 Dr. Ricardo Daniel Olano | Cardiólogo – IPENSA La Plata
-Versión 6.0 – 2026
+Versión 6.5 – 2026
 """
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -56,6 +56,14 @@ THRESHOLDS = {
 
 OUTLIER = {'PAD_min': 40, 'PAD_max': 130, 'PAS_max': 230, 'PP_max': 80, 'PP_min': 20}
 
+# Control de calidad temporal / nocturno.
+# El intervalo se expresa con precisión de minutos y se aplica por HORA REAL
+# de cada lectura, nunca por tiempo transcurrido desde la primera fila OCR.
+DEFAULT_NIGHT_START = "23:00"
+DEFAULT_NIGHT_END   = "07:00"
+MIN_NOCTURNAL_READINGS = 7
+OCR_TABLE_LAST_PAGES = 3
+
 DOCTOR_NAME     = "Ricardo Daniel Olano"
 DOCTOR_TITLE    = "Especialista Universitario en Cardiología"
 DOCTOR_SUBTITLE = "Cardiólogo Especialista en Hipertensión Arterial y Mecánica Vascular"
@@ -107,8 +115,88 @@ def time_to_minutes(hora_str):
     try:
         parts = str(hora_str).strip().split(':')
         return int(parts[0]) % 24 * 60 + int(parts[1])
-    except:
+    except Exception:
         return None
+
+
+def _clock_spec_to_minutes(value):
+    """Convierte HH:MM, hora entera o número decimal de horas a minutos 0..1439."""
+    if value is None:
+        return None
+
+    if isinstance(value, (int, np.integer)):
+        h = int(value)
+        if h == 24:
+            return 0
+        return h * 60 if 0 <= h <= 23 else None
+
+    if isinstance(value, (float, np.floating)) and np.isfinite(value):
+        x = float(value)
+        if x == 24.0:
+            return 0
+        if 0.0 <= x < 24.0:
+            return int(round(x * 60.0)) % 1440
+        return None
+
+    s = str(value).strip()
+    if not s:
+        return None
+
+    # HH:MM o HH:MM:SS
+    m = re.fullmatch(r"(\d{1,2})\s*:\s*(\d{1,2})(?::\d{1,2})?", s)
+    if m:
+        h, mi = int(m.group(1)), int(m.group(2))
+        if h == 24 and mi == 0:
+            return 0
+        if 0 <= h <= 23 and 0 <= mi <= 59:
+            return h * 60 + mi
+        return None
+
+    # Compatibilidad con valores antiguos de la UI: "23".
+    if re.fullmatch(r"\d{1,2}", s):
+        h = int(s)
+        if h == 24:
+            return 0
+        if 0 <= h <= 23:
+            return h * 60
+
+    return None
+
+
+def _minutes_to_hhmm(minutes):
+    if minutes is None:
+        return None
+    m = int(minutes) % 1440
+    return f"{m // 60:02d}:{m % 60:02d}"
+
+
+def _extract_night_interval(text):
+    """
+    Detecta un intervalo nocturno explícito en texto/OCR del equipo.
+    Ejemplos admitidos:
+      - Intervalo Noche (23:00 a 07:15)
+      - Intervalo nocturno: 23:00 - 07:15
+      - Noche (23:00/07:15)
+    """
+    if not text:
+        return None
+
+    t = re.sub(r"\s+", " ", str(text))
+    patterns = [
+        r"(?:intervalo\s+)?(?:noche|nocturno|nocturna)\s*[:(\[]*\s*"
+        r"(\d{1,2}:\d{2})\s*(?:a|hasta|[-–—/])\s*(\d{1,2}:\d{2})",
+        r"(?:per[ií]odo\s+)?nocturno\s+"
+        r"(\d{1,2}:\d{2})\s*(?:a|hasta|[-–—/])\s*(\d{1,2}:\d{2})",
+    ]
+    for pat in patterns:
+        m = re.search(pat, t, re.I)
+        if not m:
+            continue
+        a = _clock_spec_to_minutes(m.group(1))
+        b = _clock_spec_to_minutes(m.group(2))
+        if a is not None and b is not None and a != b:
+            return _minutes_to_hhmm(a), _minutes_to_hhmm(b)
+    return None
 
 def img_to_bytes(path_or_bytesio):
     if path_or_bytesio is None:
@@ -271,7 +359,7 @@ def _generated_report_error(full_text):
 
 
 @st.cache_data(show_spinner=False, ttl=3600, max_entries=8)
-def parse_mapa_pdf_cached(file_bytes, cache_version="v6.4-fast-grid-meta-timeout"):
+def parse_mapa_pdf_cached(file_bytes, cache_version="v6.5-night-clock-ocr3-qc"):
     """
     Versión cacheada del parser pesado. Evita re-ejecutar OCR y parsers
     en cada rerun de Streamlit. El cache se invalida automáticamente si
@@ -324,7 +412,7 @@ def parse_mapa_pdf(pdf_file):
     # 2) OCR liviano de primeras páginas para paciente, obra social, inicio/fin.
     try:
         pdf_file.seek(0)
-        meta_ocr_text = _ocr_metadata_pages(pdf_file, dpi=190, max_pages=2)
+        meta_ocr_text = _ocr_metadata_pages(pdf_file, dpi=190, max_pages=3)
         diagnostics.append(f"OCR metadatos: {len(meta_ocr_text)} caracteres")
     except Exception as e:
         diagnostics.append(f"OCR metadatos no disponible o falló: {e}")
@@ -345,7 +433,7 @@ def parse_mapa_pdf(pdf_file):
     df = None
     try:
         pdf_file.seek(0)
-        df_layout = _ocr_medicaldb_table_layout(pdf_file, dpi=170, last_pages=2)
+        df_layout = _ocr_medicaldb_table_layout(pdf_file, dpi=170, last_pages=OCR_TABLE_LAST_PAGES)
         if df_layout is not None:
             df = df_layout
             diagnostics.append(f"OCR por grilla/celdas: {len(df_layout)} lecturas")
@@ -357,7 +445,7 @@ def parse_mapa_pdf(pdf_file):
     m_total = re.search(r"Total\s+de\s+Mediciones\s+v[áa]lidas[:\s]+(\d{2,3})", full_text_pre, re.I)
     if m_total:
         try:
-            min_expected = max(20, int(int(m_total.group(1)) * 0.70))
+            min_expected = max(20, int(np.ceil(int(m_total.group(1)) * 0.90)))
         except Exception:
             pass
 
@@ -366,7 +454,7 @@ def parse_mapa_pdf(pdf_file):
     if need_full_ocr:
         try:
             pdf_file.seek(0)
-            ocr_text = _ocr_pdf_pages(pdf_file, dpi=150, first_pages=0, last_pages=2)
+            ocr_text = _ocr_pdf_pages(pdf_file, dpi=150, first_pages=0, last_pages=OCR_TABLE_LAST_PAGES)
             diagnostics.append(f"OCR completo acotado: {len(ocr_text)} caracteres")
         except Exception as e:
             diagnostics.append(f"OCR completo no disponible o falló: {e}")
@@ -440,9 +528,35 @@ def parse_mapa_pdf(pdf_file):
         df = df.drop_duplicates(subset=subset, keep='first')
     df = df.reset_index(drop=True)
 
+    # Control de integridad: no aceptar silenciosamente una tabla OCR parcial
+    # cuando el propio equipo informa cuántas mediciones válidas existen.
+    reported_total = meta.get("n_validas_pdf")
+    if reported_total:
+        try:
+            reported_total = int(reported_total)
+            coverage = len(df) / reported_total if reported_total > 0 else 1.0
+            diagnostics.append(
+                f"Cobertura tabla vs. válidas informadas: {len(df)}/{reported_total} ({coverage*100:.1f}%)"
+            )
+            if coverage < 0.90:
+                msg = (
+                    "La TABLA COMPLETA fue importada de forma parcial: "
+                    f"se recuperaron {len(df)} lecturas de {reported_total} válidas informadas por el equipo "
+                    f"({coverage*100:.1f}%). Se detiene el análisis para evitar promedios y períodos "
+                    "circadianos falsos. Reprocesar OCR o revisar las páginas de Tabla Completa. "
+                    "Diagnóstico técnico: " + " | ".join(diagnostics)
+                )
+                return None, msg, full_text
+        except Exception:
+            pass
+
     # 7) Eje temporal y períodos.
     df = _ensure_datetime_sequence(df, meta)
-    df = assign_periods(df)
+    df = assign_periods(
+        df,
+        noc_start=meta.get("noc_start", DEFAULT_NIGHT_START),
+        noc_end=meta.get("noc_end", DEFAULT_NIGHT_END),
+    )
 
     # 8) Completar metadatos desde tabla si faltan.
     if "fecha_inicio" not in meta and "dt" in df.columns and df["dt"].notna().any():
@@ -893,7 +1007,7 @@ def _choose_plausible_row_from_cells(cells, reference_year=None):
     }
 
 
-def _ocr_medicaldb_table_layout(pdf_file, dpi=170, last_pages=2):
+def _ocr_medicaldb_table_layout(pdf_file, dpi=170, last_pages=OCR_TABLE_LAST_PAGES):
     """
     OCR por grilla de las páginas finales de la Tabla Completa MedicalDB.
     Optimizado para velocidad: detecta la grilla, recorta SOLO la tabla y ejecuta
@@ -914,7 +1028,7 @@ def _ocr_medicaldb_table_layout(pdf_file, dpi=170, last_pages=2):
     mat = fitz.Matrix(dpi/72.0, dpi/72.0)
 
     try:
-        ref_text = _ocr_metadata_pages(io.BytesIO(data), dpi=150, max_pages=2)
+        ref_text = _ocr_metadata_pages(io.BytesIO(data), dpi=150, max_pages=3)
     except Exception:
         ref_text = ""
     ref_year = _study_reference_year(ref_text)
@@ -1764,6 +1878,29 @@ def _extract_meta(text):
         if m:
             meta["hora_fin"] = _normalize_time_token(m.group(1))
 
+    # Intervalo nocturno explícito informado por el equipo.
+    night_window = _extract_night_interval(flat_space)
+    if night_window:
+        meta["noc_start"], meta["noc_end"] = night_window
+        meta["periodo_nocturno_fuente"] = "PDF del equipo"
+
+    # Calidad informada por el equipo: cantidad y porcentaje de lecturas válidas.
+    m_valid = re.search(
+        r"Total\s+de\s+Mediciones\s+v[áa]lidas[:\s]+(\d{1,3})(?:\s*[/|]\s*(\d{1,3})\s*%)?",
+        flat_space, re.I
+    )
+    if m_valid:
+        try:
+            nv = int(m_valid.group(1))
+            if 1 <= nv <= 300:
+                meta["n_validas_pdf"] = nv
+            if m_valid.group(2):
+                pv = int(m_valid.group(2))
+                if 0 <= pv <= 100:
+                    meta["pct_validas_pdf"] = pv
+        except Exception:
+            pass
+
     # Duración.
     m = re.search(r"(?:Tiempo\s+de\s+estudio|Duraci[oó]n\s+efectiva)[:\s]+(.+?)(?:L[ií]mites|Total|Solicitante|Lecturas|\n)", flat_space, re.I)
     if m:
@@ -1801,68 +1938,137 @@ def _extract_meta(text):
     return meta
 
 
-def assign_periods(df, noc_start=23, noc_end=7, diurno_desde_primera=True):
+def assign_periods(
+    df,
+    noc_start=DEFAULT_NIGHT_START,
+    noc_end=DEFAULT_NIGHT_END,
+    diurno_desde_primera=False,
+):
     """
-    Asigna período Diurno/Nocturno sobre el eje temporal continuo.
+    Asigna Diurno/Nocturno por la HORA REAL DE RELOJ de cada lectura.
 
-    Regla operativa solicitada:
-    - La PRIMERA medición válida inicia el período DIURNO.
-    - Desde allí, el primer período nocturno comienza al alcanzar noc_start.
-    - Finaliza en noc_end y luego vuelve a Diurno.
-    - La clasificación se recalcula de forma coherente para todas las lecturas;
-      no se conservan etiquetas OCR aisladas que puedan fragmentar el gráfico.
+    Corrección v6.5:
+    - NO usa la primera fila OCR como inicio forzado del período diurno.
+    - Admite minutos exactos (por ejemplo 23:00-07:15).
+    - Admite intervalos que cruzan medianoche.
+    - Conserva ``diurno_desde_primera`` sólo por compatibilidad con llamadas
+      antiguas; el argumento ya no modifica la clasificación.
+
+    El intervalo es semiabierto [inicio, fin):
+      23:00 <= hora < 24:00  -> Nocturno
+      00:00 <= hora < 07:15  -> Nocturno
+      07:15                  -> Diurno
     """
     out = df.copy()
     if len(out) == 0:
-        out['Período'] = pd.Series(dtype='object')
+        out["Período"] = pd.Series(dtype="object")
+        out["periodo_asumido"] = pd.Series(dtype="bool")
         return out
 
-    # Asegurar eje continuo. Si tplot parece corrupto (>30 h en un MAPA estándar),
-    # reconstruirlo desde las horas de reloj.
-    need_rebuild = ('tplot' not in out.columns or pd.to_numeric(out.get('tplot'), errors='coerce').isna().all())
-    if not need_rebuild:
-        tp = pd.to_numeric(out['tplot'], errors='coerce')
-        try:
-            need_rebuild = (tp.max() - tp.min()) > 1800  # >30 h: muy probablemente eje OCR espurio
-        except Exception:
-            need_rebuild = True
-    if need_rebuild:
-        out = _canonicalize_mapa_time_axis(out)
-    else:
-        out['tplot'] = pd.to_numeric(out['tplot'], errors='coerce')
-        out = out.sort_values('tplot', kind='mergesort').reset_index(drop=True)
+    if "hora" not in out.columns:
+        raise ValueError(
+            "No se puede asignar el período nocturno: la tabla no contiene columna 'hora'."
+        )
 
-    # Hora de reloj de la primera medición real del eje.
-    first_clock = None
-    if 'hora' in out.columns and len(out):
-        first_clock = time_to_minutes(out.iloc[0]['hora'])
-    if first_clock is None:
-        first_clock = 0
+    start_min = _clock_spec_to_minutes(noc_start)
+    end_min = _clock_spec_to_minutes(noc_end)
+    if start_min is None or end_min is None:
+        raise ValueError(
+            "Horario nocturno inválido. Usar HH:MM, por ejemplo 23:00 y 07:15."
+        )
+    if start_min == end_min:
+        raise ValueError(
+            "El inicio y el fin del período nocturno no pueden ser iguales."
+        )
 
-    night_start_elapsed = float((int(noc_start) * 60 - int(first_clock)) % 1440)
-    night_duration = float((int(noc_end) * 60 - int(noc_start) * 60) % 1440)
-    if night_duration == 0:
-        night_duration = 8 * 60.0
+    clock = out["hora"].apply(_clock_spec_to_minutes)
 
-    t = pd.to_numeric(out['tplot'], errors='coerce')
-    first_t = float(t.dropna().iloc[0]) if t.notna().any() else 0.0
-    elapsed = t - first_t
+    # Etiquetas previas sólo se usan como rescate cuando una hora individual
+    # es ilegible; nunca desplazan la regla principal por hora real.
+    existing = None
+    if "Período" in out.columns:
+        existing = out["Período"].astype(str).str.strip().str.lower()
 
     periods = []
-    for e in elapsed:
-        if pd.isna(e):
-            periods.append('Diurno')
+    assumed = []
+    for idx, minute in clock.items():
+        if minute is None or pd.isna(minute):
+            prior = existing.loc[idx] if existing is not None and idx in existing.index else ""
+            if re.search(r"noch|noct", prior, re.I):
+                periods.append("Nocturno")
+                assumed.append(False)
+            elif re.search(r"dia|diur|día", prior, re.I):
+                periods.append("Diurno")
+                assumed.append(False)
+            else:
+                periods.append("No asignado")
+                assumed.append(True)
             continue
-        e = float(e)
-        if diurno_desde_primera and e < night_start_elapsed:
-            periods.append('Diurno')
-            continue
-        rel = (e - night_start_elapsed) % 1440.0
-        periods.append('Nocturno' if 0.0 <= rel < night_duration else 'Diurno')
 
-    out['Período'] = periods
-    out['periodo_asumido'] = True
+        minute = int(minute)
+        if start_min > end_min:
+            is_night = (minute >= start_min) or (minute < end_min)
+        else:
+            is_night = (start_min <= minute < end_min)
+
+        periods.append("Nocturno" if is_night else "Diurno")
+        assumed.append(True)
+
+    out["Período"] = periods
+    out["periodo_asumido"] = assumed
+    out["noc_start_aplicado"] = _minutes_to_hhmm(start_min)
+    out["noc_end_aplicado"] = _minutes_to_hhmm(end_min)
     return out
+
+
+def validate_period_assignment(df, min_nocturnal=MIN_NOCTURNAL_READINGS):
+    """
+    Control de calidad antes de calcular métricas.
+
+    Devuelve conteos y banderas; no altera el DataFrame.
+    """
+    if "Período" not in df.columns:
+        return {
+            "ok": False,
+            "n_total": len(df),
+            "n_diurno": 0,
+            "n_nocturno": 0,
+            "n_no_asignado": len(df),
+            "message": "La tabla no contiene clasificación Diurno/Nocturno.",
+        }
+
+    per = df["Período"].astype(str).str.strip()
+    n_day = int((per == "Diurno").sum())
+    n_night = int((per == "Nocturno").sum())
+    n_unknown = int((~per.isin(["Diurno", "Nocturno"])).sum())
+
+    ok = n_night >= int(min_nocturnal) and n_unknown == 0
+    if n_unknown:
+        msg = (
+            f"Hay {n_unknown} lecturas sin período asignable por horario. "
+            "Revisar la columna hora/OCR antes de generar el informe."
+        )
+    elif n_night < int(min_nocturnal):
+        msg = (
+            f"Período nocturno no evaluable: se detectaron {n_night} lecturas "
+            f"nocturnas; se requieren al menos {int(min_nocturnal)} para el "
+            "control de calidad configurado. Revisar OCR e intervalo nocturno."
+        )
+    else:
+        msg = (
+            f"Asignación temporal consistente: {n_day} lecturas diurnas y "
+            f"{n_night} nocturnas."
+        )
+
+    return {
+        "ok": ok,
+        "n_total": len(df),
+        "n_diurno": n_day,
+        "n_nocturno": n_night,
+        "n_no_asignado": n_unknown,
+        "message": msg,
+    }
+
 
 def clean_data(df):
     orig = len(df)
@@ -2226,7 +2432,7 @@ def _prepare_df_for_chart(df):
     # Preservar la clasificación realizada en main() con el horario nocturno
     # elegido por el usuario. Sólo calcular si realmente falta.
     if 'Período' not in out.columns or out['Período'].isna().all():
-        out = assign_periods(out, diurno_desde_primera=True)
+        out = assign_periods(out)
     else:
         per = out['Período'].astype(str).str.strip().str.lower()
         out['Período'] = np.where(
@@ -3232,10 +3438,12 @@ def main():
         firma_file = st.file_uploader("Subir firma (PNG/JPG)", type=['png','jpg','jpeg'],
                                        key='firma', label_visibility='collapsed')
         st.markdown("---")
-        st.markdown("**Período nocturno para filas sin etiqueta**")
-        noc_start = st.number_input("Inicio nocturno (hs)", 20, 24, 23, 1)
-        noc_end   = st.number_input("Fin nocturno (hs)", 4, 10, 7, 1)
-        st.caption("Regla temporal: la primera medición es la primera fila con horario válido reportada por el equipo; ese horario fija t=0 h y el período diurno comienza allí.")
+        st.markdown("**Período nocturno**")
+        st.caption(
+            "Se clasifica por la hora real de cada lectura. El intervalo exacto "
+            "(HH:MM) puede corregirse antes de generar; si el PDF lo informa, "
+            "la app intenta autocompletarlo."
+        )
         st.markdown("---")
 
         if st.button("♻️ Reprocesar PDF / limpiar caché", use_container_width=True):
@@ -3367,6 +3575,8 @@ def main():
     dispositivo_default = meta.get("dispositivo", "No especificado")
     manguito_default = meta.get("manguito", "No especificado")
     dur_str_default = meta.get("duracion_str", meta.get("duracion", "No especificado"))
+    noc_start_default = meta.get("noc_start", DEFAULT_NIGHT_START)
+    noc_end_default = meta.get("noc_end", DEFAULT_NIGHT_END)
 
     st.subheader("2. Datos importados automáticamente")
     c1, c2, c3, c4 = st.columns(4)
@@ -3380,6 +3590,11 @@ def main():
     c6.metric("Fin", hora_fin_default)
     c7.metric("Duración", dur_str_default)
     c8.metric("Dispositivo", dispositivo_default[:24])
+
+    st.caption(
+        f"Intervalo nocturno propuesto: {noc_start_default}–{noc_end_default}"
+        + (" (detectado en PDF)" if meta.get("periodo_nocturno_fuente") else " (editable)")
+    )
 
     with st.expander("Vista previa de lecturas importadas", expanded=False):
         st.dataframe(df_raw, use_container_width=True)
@@ -3409,6 +3624,21 @@ def main():
         fecha_estudio = f1.text_input("Fecha estudio", value=fecha_default)
         hora_inicio = f2.text_input("Hora inicio", value=hora_inicio_default)
         hora_fin = f3.text_input("Hora fin", value=hora_fin_default)
+
+        n1, n2 = st.columns(2)
+        noc_start = n1.text_input(
+            "Inicio período nocturno (HH:MM)",
+            value=str(noc_start_default),
+        )
+        noc_end = n2.text_input(
+            "Fin período nocturno (HH:MM)",
+            value=str(noc_end_default),
+        )
+        st.caption(
+            "La clasificación se realiza por hora real de reloj; se admiten minutos exactos, "
+            "por ejemplo 23:00–07:15."
+        )
+
         d1, d2 = st.columns(2)
         dispositivo = d1.text_input("Dispositivo", value=dispositivo_default)
         manguito = d2.text_input("Manguito", value=manguito_default)
@@ -3428,18 +3658,53 @@ def main():
                 base_date=fecha_estudio,
             )
 
-            # Recalcular períodos para TODO el estudio: primera medición = inicio
-            # diurno; primer nocturno posterior = noc_start; fin = noc_end.
-            df_work = assign_periods(
-                df_work, noc_start=int(noc_start), noc_end=int(noc_end),
-                diurno_desde_primera=True
-            )
+            # Recalcular períodos para TODO el estudio por HORA REAL.
+            # No se fuerza la primera lectura OCR como inicio diurno.
+            if _clock_spec_to_minutes(noc_start) is None or _clock_spec_to_minutes(noc_end) is None:
+                st.error(
+                    "Intervalo nocturno inválido. Use formato HH:MM, "
+                    "por ejemplo 23:00 y 07:15."
+                )
+                return
+
+            try:
+                df_work = assign_periods(
+                    df_work,
+                    noc_start=noc_start,
+                    noc_end=noc_end,
+                )
+            except ValueError as e:
+                st.error(str(e))
+                return
 
             df_clean, excluded, n_orig = clean_data(df_work)
 
             if len(df_clean) < 20:
-                st.error(f"Quedan sólo {len(df_clean)} lecturas válidas tras depuración. Revisar OCR/tabla. No se genera informe con una tabla incompleta.")
+                st.error(
+                    f"Quedan sólo {len(df_clean)} lecturas válidas tras depuración. "
+                    "Revisar OCR/tabla. No se genera informe con una tabla incompleta."
+                )
                 return
+
+            # Control de calidad nocturno obligatorio antes de cualquier promedio.
+            period_qc = validate_period_assignment(
+                df_clean,
+                min_nocturnal=MIN_NOCTURNAL_READINGS,
+            )
+            if not period_qc["ok"]:
+                st.error(period_qc["message"])
+                st.info(
+                    f"Conteos tras depuración: diurnas {period_qc['n_diurno']}, "
+                    f"nocturnas {period_qc['n_nocturno']}, "
+                    f"sin asignar {period_qc['n_no_asignado']}."
+                )
+                return
+
+            st.success(
+                f"Control temporal: {period_qc['n_diurno']} lecturas diurnas y "
+                f"{period_qc['n_nocturno']} nocturnas "
+                f"({noc_start}–{noc_end})."
+            )
 
             if meta.get("pct_validas_pdf"):
                 pct_val = meta.get("pct_validas_pdf")
