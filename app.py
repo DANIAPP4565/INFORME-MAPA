@@ -2,7 +2,7 @@
 """
 MAPA Informe Médico – App Streamlit
 Dr. Ricardo Daniel Olano | Cardiólogo – IPENSA La Plata
-Versión 6.8 – 2026
+Versión 6.9 – 2026
 """
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -12,7 +12,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import pdfplumber
-import io, base64, os, re, warnings, hashlib, shutil, subprocess, platform
+import io, base64, os, re, warnings, hashlib, shutil, subprocess, platform, zipfile, traceback
 from datetime import datetime
 from pathlib import Path
 import matplotlib
@@ -614,7 +614,7 @@ def _generated_report_error(full_text):
 
 
 @st.cache_data(show_spinner=False, ttl=3600, max_entries=8)
-def parse_mapa_pdf_cached(file_bytes, cache_version="v6.8-night-window-qc"):
+def parse_mapa_pdf_cached(file_bytes, cache_version="v6.9-night-window-qc-batch"):
     """
     Versión cacheada del parser pesado. Evita re-ejecutar OCR y parsers
     en cada rerun de Streamlit. El cache se invalida automáticamente si
@@ -3894,6 +3894,704 @@ def _try_import_ocr_stack():
         return None, None, None, str(e)
 
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PROCESAMIENTO POR LOTES MAPA
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _sanitizar_nombre_archivo(valor, fallback="archivo"):
+    txt = str(valor or "").strip()
+    if not txt:
+        txt = fallback
+    txt = re.sub(r'[<>:"/\\|?*]+', '-', txt)
+    txt = re.sub(r'\s+', ' ', txt).strip(' ._-')
+    return txt or fallback
+
+
+def _componente_nombre_archivo(valor, fallback="SD"):
+    txt = _sanitizar_nombre_archivo(valor, fallback)
+    txt = re.sub(r'[^A-Za-z0-9ÁÉÍÓÚÜÑáéíóúüñ,() -]+', '_', txt)
+    txt = re.sub(r'\s+', ' ', txt).strip(' ._-')
+    return txt or fallback
+
+
+def _paciente_desde_nombre_archivo(nombre_archivo):
+    base = Path(str(nombre_archivo or "")).stem
+    base = re.sub(r'[_-]+', ' ', base)
+    base = re.sub(
+        r'\b(?:MAPA|ABPM|PRESUROMETRIA|PRESUROMETRÍA|INFORME|REPORTE|ESTUDIO|ORIGINAL|PDF|FINAL|COPIA)\b',
+        ' ', base, flags=re.IGNORECASE
+    )
+    base = re.sub(r'\b\d{1,4}\b', ' ', base)
+    base = re.sub(r'\s+', ' ', base).strip(' -_,.')
+    return base.title() if len(base) >= 3 else ""
+
+
+def _nombre_salida_mapa(paciente, fecha_estudio, obra_social):
+    paciente = _componente_nombre_archivo(paciente, "PACIENTE").upper()
+    fecha = _componente_nombre_archivo(fecha_estudio, "SIN-FECHA").replace('/', '-')
+    cobertura = _componente_nombre_archivo(obra_social, "SIN OBRA SOCIAL").upper()
+    return f"{paciente}, {fecha}, MAPA, {cobertura}.pdf"
+
+
+def _nombre_unico_lote(nombre, usados):
+    nombre = _sanitizar_nombre_archivo(nombre, "Informe_MAPA.pdf")
+    stem = Path(nombre).stem
+    suffix = Path(nombre).suffix or ".pdf"
+    candidato = f"{stem}{suffix}"
+    n = 2
+    while candidato.lower() in usados:
+        candidato = f"{stem} ({n}){suffix}"
+        n += 1
+    usados.add(candidato.lower())
+    return candidato
+
+
+def _bytes_asset(uploaded_file, default_path=None):
+    if uploaded_file is not None:
+        try:
+            return bytes(uploaded_file.getvalue())
+        except Exception:
+            try:
+                uploaded_file.seek(0)
+                return bytes(uploaded_file.read())
+            except Exception:
+                pass
+    if default_path:
+        try:
+            p = Path(default_path)
+            if p.exists() and p.is_file():
+                return p.read_bytes()
+        except Exception:
+            pass
+    return None
+
+
+def _combinar_firma_y_sello(firma_bytes, sello_bytes):
+    """Combina firma y sello en una única imagen para conservar el generador PDF existente."""
+    if not firma_bytes and not sello_bytes:
+        return None
+    if firma_bytes and not sello_bytes:
+        return firma_bytes
+    if sello_bytes and not firma_bytes:
+        return sello_bytes
+    try:
+        from PIL import Image as PILImage
+        firma = PILImage.open(io.BytesIO(firma_bytes)).convert("RGBA")
+        sello = PILImage.open(io.BytesIO(sello_bytes)).convert("RGBA")
+
+        max_h = 520
+        for im in (firma, sello):
+            if im.height > max_h:
+                ratio = max_h / float(im.height)
+                im.thumbnail((max(1, int(im.width * ratio)), max_h))
+
+        alto = max(firma.height, sello.height)
+        margen = max(20, alto // 20)
+        ancho = firma.width + sello.width + margen * 3
+        lienzo = PILImage.new("RGBA", (ancho, alto + margen * 2), (255, 255, 255, 0))
+        lienzo.alpha_composite(firma, (margen, margen + (alto - firma.height) // 2))
+        lienzo.alpha_composite(sello, (margen * 2 + firma.width, margen + (alto - sello.height) // 2))
+        buf = io.BytesIO()
+        lienzo.save(buf, format="PNG")
+        return buf.getvalue()
+    except Exception:
+        # La firma es prioritaria si no puede construirse la composición.
+        return firma_bytes or sello_bytes
+
+
+def _resolver_recursos_institucionales(logo_file=None, firma_file=None, sello_file=None):
+    logo_bytes = _bytes_asset(logo_file, "/mnt/data/logo IPENSA.png")
+    firma_bytes = _bytes_asset(firma_file, "/mnt/data/FIRMA PNG.png")
+    sello_bytes = _bytes_asset(sello_file, "/mnt/data/SELLO PNG.png")
+    return logo_bytes, _combinar_firma_y_sello(firma_bytes, sello_bytes), sello_bytes
+
+
+def _edad_mapa_desde_meta(meta):
+    edad = meta.get("edad") if isinstance(meta, dict) else None
+    try:
+        edad = int(float(str(edad).replace(',', '.')))
+        if 0 <= edad <= 120:
+            return edad
+    except Exception:
+        pass
+    return None
+
+
+def _normalizar_sexo_mapa(valor):
+    s = str(valor or "").strip().lower()
+    if s.startswith('f') or 'mujer' in s:
+        return "Femenino"
+    if s.startswith('m') or 'varon' in s or 'varón' in s or 'hombre' in s:
+        return "Masculino"
+    return "No especificado"
+
+
+def _fecha_tabla_o_actual(df_raw, meta):
+    fecha = str((meta or {}).get("fecha_inicio") or "").strip()
+    if fecha:
+        return fecha
+    if df_raw is not None and 'fecha' in df_raw.columns:
+        serie = df_raw['fecha'].dropna().astype(str)
+        if not serie.empty and serie.iloc[0].strip():
+            return serie.iloc[0].strip()
+    return datetime.now().strftime("%d/%m/%Y")
+
+
+def _hora_tabla(df_raw, primera=True):
+    if df_raw is None or 'hora' not in df_raw.columns or len(df_raw) == 0:
+        return "–"
+    serie = df_raw['hora'].dropna().astype(str)
+    if serie.empty:
+        return "–"
+    return str(serie.iloc[0] if primera else serie.iloc[-1])[:5]
+
+
+def _procesar_pdf_mapa_lote(
+    pdf_bytes,
+    archivo_origen,
+    logo_bytes,
+    firma_sello_bytes,
+    noc_start_respaldo=DEFAULT_NIGHT_START,
+    noc_end_respaldo=DEFAULT_NIGHT_END,
+    obra_social_respaldo="",
+    solicitante_respaldo="",
+):
+    """Procesa un PDF MAPA de manera completamente aislada del resto del lote."""
+    if not pdf_bytes:
+        raise ValueError("El PDF está vacío.")
+
+    df_raw, meta_or_error, raw_text = parse_mapa_pdf(io.BytesIO(pdf_bytes))
+    if df_raw is None:
+        raise ValueError(str(meta_or_error or "No se pudo importar la Tabla Completa del PDF."))
+    if not isinstance(meta_or_error, dict):
+        raise ValueError("Los metadatos del estudio no pudieron interpretarse.")
+    meta = dict(meta_or_error)
+
+    paciente = str(meta.get("paciente") or "").strip()
+    if not paciente or paciente.upper() in {"NO ESPECIFICADO", "PACIENTE"}:
+        paciente = _paciente_desde_nombre_archivo(archivo_origen)
+    if not paciente:
+        raise ValueError("No se reconoció el nombre del paciente ni pudo recuperarse del nombre del archivo.")
+
+    edad = _edad_mapa_desde_meta(meta)
+    if edad is None:
+        raise ValueError("No se reconoció una edad válida. El lote no inventa edades para calcular el informe.")
+
+    sexo = _normalizar_sexo_mapa(meta.get("sexo"))
+    if edad < 17 and sexo == "No especificado":
+        raise ValueError("En pacientes pediátricos se requiere sexo reconocido para aplicar referencias apropiadas.")
+
+    obra_social = str(meta.get("obra_social") or obra_social_respaldo or "SIN OBRA SOCIAL").strip()
+    solicitante = str(meta.get("solicitante") or solicitante_respaldo or "–").strip()
+    motivo = str(meta.get("motivo") or "–").strip()
+    fecha_estudio = _fecha_tabla_o_actual(df_raw, meta)
+    hora_inicio = str(meta.get("hora_inicio") or _hora_tabla(df_raw, True))[:5]
+    hora_fin = str(meta.get("hora_fin") or _hora_tabla(df_raw, False))[:5]
+    dispositivo = str(meta.get("dispositivo") or "No especificado")
+    manguito = str(meta.get("manguito") or "No especificado")
+    duracion = str(meta.get("duracion_str") or meta.get("duracion") or "No especificado")
+    proposed_noc_start = str(meta.get("noc_start") or noc_start_respaldo or DEFAULT_NIGHT_START)
+    proposed_noc_end = str(meta.get("noc_end") or noc_end_respaldo or DEFAULT_NIGHT_END)
+    noc_start, noc_end, night_warning = _safe_night_window(proposed_noc_start, proposed_noc_end)
+    if night_warning and not meta.get("periodo_nocturno_descartado"):
+        # Un intervalo de respaldo ingresado por el usuario debe ser seguro; no se corrige
+        # silenciosamente porque afectaría los promedios y el patrón dipper.
+        if not meta.get("noc_start") and not meta.get("noc_end"):
+            raise ValueError(
+                "Intervalo nocturno de respaldo inseguro: " + night_warning +
+                " Use una ventana que cruce medianoche, por ejemplo 23:00–07:00."
+            )
+
+    df_work = _canonicalize_mapa_time_axis(
+        df_raw.copy(), anchor_time=hora_inicio, base_date=fecha_estudio
+    )
+    df_work = assign_periods(df_work, noc_start=noc_start, noc_end=noc_end)
+    df_clean, excluded, n_orig = clean_data(df_work)
+
+    if len(df_clean) < 20:
+        raise ValueError(
+            f"Sólo quedaron {len(df_clean)} lecturas válidas tras depuración; se requieren al menos 20."
+        )
+
+    period_qc = validate_period_assignment(df_clean, min_nocturnal=MIN_NOCTURNAL_READINGS)
+    if not period_qc.get("ok"):
+        raise ValueError(period_qc.get("message") or "No se superó el control de calidad de períodos.")
+
+    pct_val = meta.get("pct_validas_pdf")
+    if not pct_val:
+        pct_val = round(len(df_clean) / n_orig * 100, 1) if n_orig else "–"
+
+    is_ped = edad < 17
+    sex_code = "F" if sexo == "Femenino" else "M"
+    metricas = calculate_metrics(
+        df_clean,
+        age=edad if is_ped else None,
+        is_ped=is_ped,
+        sex=sex_code,
+        height=None,
+    )
+    phenotype = classify_phenotype(metricas)
+
+    pat_info = {
+        "nombre": paciente,
+        "edad": str(edad),
+        "sexo": sexo,
+        "obra_social": obra_social,
+        "solicitante": solicitante,
+        "motivo": motivo,
+        "is_pediatric": is_ped,
+        "duracion_str": duracion,
+    }
+    stu_info = {
+        "fecha": fecha_estudio,
+        "inicio": hora_inicio,
+        "fin": hora_fin,
+        "duracion": duracion,
+        "dispositivo": dispositivo,
+        "manguito": manguito,
+        "pct_validas": str(pct_val),
+    }
+
+    pdf_buf = generate_pdf(
+        df_clean, metricas, pat_info, stu_info, phenotype,
+        logo_bytes, firma_sello_bytes, excluded
+    )
+    pdf_resultado = pdf_buf.getvalue() if hasattr(pdf_buf, 'getvalue') else bytes(pdf_buf)
+    if not pdf_resultado.startswith(b'%PDF'):
+        raise ValueError("El generador no devolvió un PDF válido.")
+
+    # La curva MAPA real se digitaliza desde las mismas lecturas validadas usadas
+    # para los cálculos y el informe, nunca desde una imagen o informe previo.
+    chart_buf = generate_chart(df_clean, metricas)
+    chart_bytes = chart_buf.getvalue()
+    if not chart_bytes.startswith(b'\x89PNG'):
+        raise ValueError("No se pudo generar la curva temporal MAPA real.")
+
+    csv_io = io.StringIO()
+    df_clean.to_csv(csv_io, index=False, encoding="utf-8-sig")
+    csv_bytes = csv_io.getvalue().encode("utf-8-sig")
+
+    base_name = Path(_nombre_salida_mapa(paciente, fecha_estudio, obra_social)).stem
+    nombre_pdf = f"{base_name}.pdf"
+    nombre_curva = f"{base_name}_curva_MAPA.png"
+    nombre_csv = f"{base_name}_lecturas_depuradas.csv"
+
+    _, repo_summary = _repo_summary_row(
+        df_clean, metricas, pat_info, stu_info, phenotype, excluded, n_orig, base_name
+    )
+    repo_summary.update({
+        "archivo_origen": archivo_origen,
+        "archivo_informe": nombre_pdf,
+        "estado_lote": "GENERADO",
+        "curva_digitalizada": True,
+        "intervalo_nocturno": f"{noc_start}-{noc_end}",
+        "advertencia_periodo_nocturno": (
+            meta.get("periodo_nocturno_descartado") or night_warning or ""
+        ),
+    })
+
+    return {
+        "archivo_origen": archivo_origen,
+        "nombre_pdf": nombre_pdf,
+        "nombre_curva": nombre_curva,
+        "nombre_csv": nombre_csv,
+        "pdf_bytes": pdf_resultado,
+        "chart_bytes": chart_bytes,
+        "csv_bytes": csv_bytes,
+        "df_clean": df_clean,
+        "metricas": metricas,
+        "pat_info": pat_info,
+        "stu_info": stu_info,
+        "phenotype": phenotype,
+        "excluded": excluded,
+        "n_orig": n_orig,
+        "base_name": base_name,
+        "summary": repo_summary,
+        "raw_text": raw_text,
+        "period_qc": period_qc,
+        "night_warning": meta.get("periodo_nocturno_descartado") or night_warning,
+        "intervalo_nocturno": f"{noc_start}–{noc_end}",
+    }
+
+
+def _excel_resumen_lote_mapa(exitos, errores):
+    salida = io.BytesIO()
+    resumen = pd.DataFrame([x.get("summary", {}) for x in exitos])
+    errores_df = pd.DataFrame(errores)
+    with pd.ExcelWriter(salida, engine="openpyxl") as writer:
+        (resumen if not resumen.empty else pd.DataFrame(columns=["estado_lote"])).to_excel(
+            writer, sheet_name="INFORMES_GENERADOS", index=False
+        )
+        (errores_df if not errores_df.empty else pd.DataFrame(columns=["archivo", "estado", "motivo"])).to_excel(
+            writer, sheet_name="ERRORES", index=False
+        )
+        control = pd.DataFrame([{
+            "fecha_procesamiento": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "pdf_seleccionados": len(exitos) + len(errores),
+            "informes_generados": len(exitos),
+            "estudios_con_error": len(errores),
+            "regla": "Cada PDF se procesa de forma independiente; un error no detiene el lote.",
+        }])
+        control.to_excel(writer, sheet_name="CONTROL_LOTE", index=False)
+        for sheet in writer.book.sheetnames:
+            ws = writer.book[sheet]
+            ws.freeze_panes = "A2"
+            for col_cells in ws.columns:
+                letter = col_cells[0].column_letter
+                max_len = max((len(str(c.value)) if c.value is not None else 0 for c in col_cells[:100]), default=10)
+                ws.column_dimensions[letter].width = max(10, min(max_len + 2, 55))
+    return salida.getvalue()
+
+
+def save_batch_to_excel_repository(exitos):
+    """Agrega estudios exitosos en una sola escritura, preservando el historial previo."""
+    if not exitos:
+        return {"ok": True, "skipped": True, "n_estudios": 0, "n_mediciones": 0}
+    tmp_path = None
+    try:
+        REPO_DIR.mkdir(parents=True, exist_ok=True)
+        if REPO_XLSX.exists():
+            try:
+                studies_old = pd.read_excel(REPO_XLSX, sheet_name="ESTUDIOS")
+            except Exception:
+                studies_old = pd.DataFrame()
+            try:
+                meas_old = pd.read_excel(REPO_XLSX, sheet_name="MEDICIONES_VALIDADAS")
+            except Exception:
+                meas_old = pd.DataFrame()
+        else:
+            studies_old = pd.DataFrame()
+            meas_old = pd.DataFrame()
+
+        summaries = []
+        measurements = []
+        ids = []
+        for item in exitos:
+            study_id, summary = _repo_summary_row(
+                item["df_clean"], item["metricas"], item["pat_info"], item["stu_info"],
+                item["phenotype"], item["excluded"], item["n_orig"], item["base_name"]
+            )
+            ids.append(study_id)
+            summaries.append(summary)
+            measurements.append(_repo_measurements_df(
+                item["df_clean"], study_id, item["pat_info"], item["stu_info"], item["phenotype"]
+            ))
+
+        if not studies_old.empty and "id_estudio" in studies_old.columns:
+            studies_old = studies_old[~studies_old["id_estudio"].astype(str).isin(ids)]
+        if not meas_old.empty and "id_estudio" in meas_old.columns:
+            meas_old = meas_old[~meas_old["id_estudio"].astype(str).isin(ids)]
+
+        studies_all = pd.concat([studies_old, _df_excel_safe(pd.DataFrame(summaries))], ignore_index=True)
+        meas_new = pd.concat(measurements, ignore_index=True) if measurements else pd.DataFrame()
+        meas_all = pd.concat([meas_old, meas_new], ignore_index=True)
+
+        tmp_path = REPO_DIR / f".repositorio_mapa_{os.getpid()}_{datetime.now().strftime('%Y%m%d%H%M%S%f')}.xlsx"
+        with pd.ExcelWriter(tmp_path, engine="openpyxl") as writer:
+            studies_all.to_excel(writer, sheet_name="ESTUDIOS", index=False)
+            meas_all.to_excel(writer, sheet_name="MEDICIONES_VALIDADAS", index=False)
+            schema = pd.DataFrame([
+                {"hoja": "ESTUDIOS", "contenido": "Una fila por MAPA procesado."},
+                {"hoja": "MEDICIONES_VALIDADAS", "contenido": "Una fila por medición validada."},
+                {"hoja": "README_REPOSITORIO", "contenido": "El modo por lotes preserva registros previos y reemplaza sólo estudios idénticos por huella."},
+            ])
+            schema.to_excel(writer, sheet_name="README_REPOSITORIO", index=False)
+            for sheet in writer.book.sheetnames:
+                ws = writer.book[sheet]
+                ws.freeze_panes = "A2"
+                for col_cells in ws.columns:
+                    letter = col_cells[0].column_letter
+                    max_len = max((len(str(c.value)) if c.value is not None else 0 for c in col_cells[:80]), default=10)
+                    ws.column_dimensions[letter].width = max(10, min(max_len + 2, 45))
+
+        os.replace(tmp_path, REPO_XLSX)
+        return {
+            "ok": True,
+            "bytes": REPO_XLSX.read_bytes(),
+            "path": str(REPO_XLSX),
+            "n_estudios": int(len(studies_all)),
+            "n_mediciones": int(len(meas_all)),
+            "agregados": len(exitos),
+        }
+    except Exception as exc:
+        try:
+            if tmp_path and Path(tmp_path).exists():
+                Path(tmp_path).unlink()
+        except Exception:
+            pass
+        return {"ok": False, "path": str(REPO_XLSX), "error": str(exc)}
+
+
+def _crear_zip_lote_mapa(exitos, errores, resumen_excel, repo_status=None, originales=None):
+    salida = io.BytesIO()
+    with zipfile.ZipFile(salida, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+        for item in exitos:
+            zf.writestr(f"informes_pdf/{item['nombre_pdf']}", item["pdf_bytes"])
+            zf.writestr(f"curvas_mapa/{item['nombre_curva']}", item["chart_bytes"])
+            zf.writestr(f"lecturas_csv/{item['nombre_csv']}", item["csv_bytes"])
+
+        zf.writestr("resumen_lote_mapa.xlsx", resumen_excel)
+        if errores:
+            zf.writestr("errores_lote.csv", pd.DataFrame(errores).to_csv(index=False).encode("utf-8-sig"))
+        if repo_status and repo_status.get("ok") and repo_status.get("bytes"):
+            zf.writestr("repositorio_mapa_estudios_actualizado.xlsx", repo_status["bytes"])
+        if originales:
+            usados_originales = set()
+            for nombre, contenido in originales:
+                nombre_seguro = _nombre_unico_lote(_sanitizar_nombre_archivo(nombre, "original.pdf"), usados_originales)
+                zf.writestr(f"pdf_originales/{nombre_seguro}", contenido)
+
+        leeme = (
+            "PROCESAMIENTO POR LOTES MAPA\n"
+            f"Fecha: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}\n"
+            f"PDF seleccionados: {len(exitos) + len(errores)}\n"
+            f"Informes generados: {len(exitos)}\n"
+            f"Estudios con error: {len(errores)}\n\n"
+            "Cada PDF fue procesado de forma independiente. Los errores individuales no detuvieron el lote.\n"
+            "La carpeta curvas_mapa contiene la curva temporal real reconstruida desde las lecturas validadas de cada paciente.\n"
+            "La carpeta lecturas_csv contiene las mediciones usadas para cálculos, gráfico e informe.\n"
+        )
+        zf.writestr("LEEME.txt", leeme.encode("utf-8"))
+    return salida.getvalue()
+
+
+def render_procesamiento_lote_mapa(logo_file, firma_file, sello_file):
+    st.subheader("📦 Procesamiento por lotes de informes MAPA")
+    st.caption(
+        "Importe simultáneamente hasta 100 PDF originales del equipo MAPA. Cada paciente se procesa "
+        "de forma independiente y recibe su informe médico, curva temporal real y CSV de lecturas."
+    )
+
+    logo_bytes, firma_sello_bytes, sello_bytes = _resolver_recursos_institucionales(
+        logo_file, firma_file, sello_file
+    )
+    recursos = []
+    if logo_bytes:
+        recursos.append("logo")
+    if firma_sello_bytes:
+        recursos.append("firma")
+    if sello_bytes:
+        recursos.append("sello")
+    st.info("Recursos comunes para todos los informes: " + (", ".join(recursos) if recursos else "ninguno cargado"))
+
+    archivos = st.file_uploader(
+        "Seleccionar PDF originales MAPA",
+        type=["pdf"],
+        accept_multiple_files=True,
+        key="mapa_lote_upload",
+        help="Máximo permitido: 100 PDF por lote.",
+    )
+
+    c1, c2 = st.columns(2)
+    with c1:
+        noc_start_respaldo = st.text_input(
+            "Inicio nocturno de respaldo (HH:MM)", value=DEFAULT_NIGHT_START,
+            key="mapa_lote_noc_start"
+        )
+        obra_social_respaldo = st.text_input(
+            "Obra social de respaldo cuando no figure", value="",
+            key="mapa_lote_obra"
+        )
+        agregar_historial = st.checkbox(
+            "Agregar estudios exitosos al historial Excel sin borrar registros previos",
+            value=True, key="mapa_lote_historial"
+        )
+    with c2:
+        noc_end_respaldo = st.text_input(
+            "Fin nocturno de respaldo (HH:MM)", value=DEFAULT_NIGHT_END,
+            key="mapa_lote_noc_end"
+        )
+        solicitante_respaldo = st.text_input(
+            "Solicitante de respaldo cuando no figure", value="",
+            key="mapa_lote_solicitante"
+        )
+        incluir_originales = st.checkbox(
+            "Incluir los PDF originales dentro del ZIP", value=False,
+            key="mapa_lote_originales"
+        )
+
+    if archivos and len(archivos) > 100:
+        st.error(f"Se seleccionaron {len(archivos)} PDF. El máximo permitido es 100.")
+
+    qc_lote_night = _validate_night_window(
+        noc_start_respaldo, noc_end_respaldo, strict_cross_midnight=True
+    )
+    intervalos_validos = bool(qc_lote_night["ok"])
+    if not intervalos_validos:
+        st.error(
+            "Intervalo nocturno de respaldo inseguro: " + qc_lote_night["reason"] +
+            " Use una ventana que cruce medianoche, por ejemplo 23:00–07:00."
+        )
+
+    procesar = st.button(
+        "⚕️ Procesar lote y generar informes MAPA",
+        type="primary",
+        use_container_width=True,
+        disabled=(not archivos or len(archivos) > 100 or not intervalos_validos),
+        key="btn_procesar_lote_mapa",
+    )
+
+    if procesar:
+        exitos, errores, originales = [], [], []
+        usados_pdf, usados_curva, usados_csv = set(), set(), set()
+        barra = st.progress(0.0, text="Preparando lote MAPA...")
+        estado = st.empty()
+
+        total = len(archivos)
+        for idx, uploaded in enumerate(archivos, start=1):
+            nombre_origen = getattr(uploaded, "name", f"MAPA_{idx}.pdf")
+            estado.info(f"Procesando {idx}/{total}: {nombre_origen}")
+            try:
+                contenido = bytes(uploaded.getvalue())
+                item = _procesar_pdf_mapa_lote(
+                    contenido,
+                    nombre_origen,
+                    logo_bytes,
+                    firma_sello_bytes,
+                    noc_start_respaldo=noc_start_respaldo,
+                    noc_end_respaldo=noc_end_respaldo,
+                    obra_social_respaldo=obra_social_respaldo,
+                    solicitante_respaldo=solicitante_respaldo,
+                )
+                item["nombre_pdf"] = _nombre_unico_lote(item["nombre_pdf"], usados_pdf)
+                item["nombre_curva"] = _nombre_unico_lote(item["nombre_curva"], usados_curva)
+                item["nombre_csv"] = _nombre_unico_lote(item["nombre_csv"], usados_csv)
+                item["summary"]["archivo_informe"] = item["nombre_pdf"]
+                exitos.append(item)
+                if incluir_originales:
+                    originales.append((nombre_origen, contenido))
+            except Exception as exc:
+                errores.append({
+                    "archivo": nombre_origen,
+                    "estado": "ERROR",
+                    "motivo": str(exc),
+                    "detalle_tecnico": traceback.format_exc(limit=2),
+                })
+            barra.progress(idx / total, text=f"Procesados {idx}/{total}")
+
+        repo_status = None
+        if agregar_historial and exitos:
+            estado.info("Actualizando el historial Excel acumulativo...")
+            repo_status = save_batch_to_excel_repository(exitos)
+
+        resumen_excel = _excel_resumen_lote_mapa(exitos, errores)
+        zip_bytes = _crear_zip_lote_mapa(
+            exitos, errores, resumen_excel, repo_status=repo_status, originales=originales
+        )
+        fecha_lote = datetime.now().strftime("%Y%m%d_%H%M%S")
+        st.session_state["mapa_lote_resultado"] = {
+            "exitos": exitos,
+            "errores": errores,
+            "repo_status": repo_status,
+            "resumen_excel": resumen_excel,
+            "zip_bytes": zip_bytes,
+            "fecha": fecha_lote,
+            "total": total,
+        }
+        estado.empty()
+        barra.empty()
+        if exitos:
+            st.success(f"Lote finalizado: {len(exitos)} informe(s) MAPA generado(s).")
+        if errores:
+            st.warning(f"{len(errores)} estudio(s) presentaron error. El resto del lote se completó normalmente.")
+
+    resultado = st.session_state.get("mapa_lote_resultado")
+    if not resultado:
+        return
+
+    exitos = resultado.get("exitos", [])
+    errores = resultado.get("errores", [])
+    advertencias_periodo = [
+        x for x in exitos if str(x.get("night_warning") or "").strip()
+    ]
+    a, b, c, d = st.columns(4)
+    a.metric("PDF seleccionados", resultado.get("total", len(exitos) + len(errores)))
+    b.metric("Informes generados", len(exitos))
+    c.metric("Con error", len(errores))
+    d.metric("Horario OCR corregido", len(advertencias_periodo))
+
+    if advertencias_periodo:
+        st.warning(
+            f"En {len(advertencias_periodo)} estudio(s) se descartó un intervalo nocturno OCR inseguro "
+            "y se aplicó 23:00–07:00 para impedir la inversión diurno/nocturno."
+        )
+        with st.expander("Ver controles de horario corregidos", expanded=False):
+            for item in advertencias_periodo:
+                st.markdown(
+                    f"**{item['pat_info']['nombre']}** · {item['archivo_origen']}  \n"
+                    f"Aplicado: {item.get('intervalo_nocturno', '23:00–07:00')}  \n"
+                    f"Motivo: {item.get('night_warning')}"
+                )
+
+    st.download_button(
+        "📦 Descargar lote completo en ZIP",
+        data=resultado.get("zip_bytes", b""),
+        file_name=f"Informes_MAPA_Lote_{resultado.get('fecha', 'lote')}.zip",
+        mime="application/zip",
+        use_container_width=True,
+        key=f"mapa_lote_zip_{resultado.get('fecha', 'actual')}",
+    )
+    st.download_button(
+        "📊 Descargar resumen del lote en Excel",
+        data=resultado.get("resumen_excel", b""),
+        file_name=f"Resumen_MAPA_Lote_{resultado.get('fecha', 'lote')}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+        key=f"mapa_lote_resumen_{resultado.get('fecha', 'actual')}",
+    )
+
+    repo_status = resultado.get("repo_status") or {}
+    if repo_status.get("ok") and repo_status.get("bytes"):
+        st.success(
+            f"Historial Excel actualizado sin borrar registros previos: "
+            f"{repo_status.get('n_estudios', 0)} estudios y {repo_status.get('n_mediciones', 0)} mediciones."
+        )
+        st.download_button(
+            "Descargar historial Excel actualizado",
+            data=repo_status["bytes"],
+            file_name="repositorio_mapa_estudios.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+            key=f"mapa_lote_repo_{resultado.get('fecha', 'actual')}",
+        )
+    elif repo_status and not repo_status.get("ok"):
+        st.warning(
+            "Los informes se generaron, pero el historial Excel no pudo actualizarse. "
+            f"Detalle: {repo_status.get('error', 'error no especificado')}"
+        )
+
+    if exitos:
+        st.markdown("### Descarga individual por paciente")
+        for idx, item in enumerate(exitos):
+            cols = st.columns([3.5, 1.2, 1.1, 1.1])
+            cols[0].markdown(
+                f"**{item['pat_info']['nombre']}**  \n"
+                f"{item['stu_info']['fecha']} · {item['phenotype']} · "
+                f"{len(item['df_clean'])} lecturas"
+            )
+            cols[1].download_button(
+                "PDF", data=item["pdf_bytes"], file_name=item["nombre_pdf"],
+                mime="application/pdf", key=f"mapa_pdf_ind_{resultado['fecha']}_{idx}"
+            )
+            cols[2].download_button(
+                "Curva", data=item["chart_bytes"], file_name=item["nombre_curva"],
+                mime="image/png", key=f"mapa_png_ind_{resultado['fecha']}_{idx}"
+            )
+            cols[3].download_button(
+                "CSV", data=item["csv_bytes"], file_name=item["nombre_csv"],
+                mime="text/csv", key=f"mapa_csv_ind_{resultado['fecha']}_{idx}"
+            )
+
+    if errores:
+        st.markdown("### Estudios con error")
+        st.dataframe(pd.DataFrame(errores).drop(columns=["detalle_tecnico"], errors="ignore"), use_container_width=True)
+        with st.expander("Detalles técnicos de errores", expanded=False):
+            for err in errores:
+                st.markdown(f"**{err.get('archivo')}**")
+                st.code(err.get("detalle_tecnico", err.get("motivo", "")))
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # STREAMLIT UI
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3934,9 +4632,12 @@ def main():
         st.markdown("**Logo institucional**")
         logo_file = st.file_uploader("Subir logo (PNG/JPG)", type=['png','jpg','jpeg'],
                                       key='logo', label_visibility='collapsed')
-        st.markdown("**Firma / sello médico**")
+        st.markdown("**Firma médica**")
         firma_file = st.file_uploader("Subir firma (PNG/JPG)", type=['png','jpg','jpeg'],
                                        key='firma', label_visibility='collapsed')
+        st.markdown("**Sello profesional**")
+        sello_file = st.file_uploader("Subir sello (PNG/JPG)", type=['png','jpg','jpeg'],
+                                       key='sello', label_visibility='collapsed')
         st.markdown("---")
         st.markdown("**Período nocturno**")
         st.caption(
@@ -3951,7 +4652,8 @@ def main():
                 "mapa_file_hash", "df_raw", "meta", "raw_text_debug",
                 "parse_error", "generated_pdf_bytes", "generated_csv_bytes", "generated_chart_bytes",
                 "generated_chart_error", "generated_base_name", "generated_audio_msg", "generated_summary",
-                "generated_repo_bytes", "generated_repo_status", "generated_repo_study_id"
+                "generated_repo_bytes", "generated_repo_status", "generated_repo_study_id",
+                "mapa_lote_resultado"
             ]:
                 st.session_state.pop(k, None)
             parse_mapa_pdf_cached.clear()
@@ -4009,6 +4711,16 @@ def main():
     st.title("🫀 MAPA – Informe Médico Ambulatorio")
     st.markdown(f"*{DOCTOR_SUBTITLE}*")
     st.markdown("---")
+
+    modo_carga = st.radio(
+        "Modalidad de procesamiento",
+        ["Informe individual", "Procesamiento por lotes"],
+        horizontal=True,
+        key="modo_carga_mapa",
+    )
+    if modo_carga == "Procesamiento por lotes":
+        render_procesamiento_lote_mapa(logo_file, firma_file, sello_file)
+        return
 
     st.subheader("1. Cargar PDF original del equipo MAPA")
     pdf_file = st.file_uploader("Subir PDF del dispositivo MAPA", type=['pdf'], key='mapa_pdf')
@@ -4272,8 +4984,9 @@ def main():
                 "pct_validas": str(pct_val),
             }
 
-            logo_bytes = img_to_bytes(logo_file) if logo_file else img_to_bytes("/mnt/data/logo IPENSA.png")
-            firma_bytes = img_to_bytes(firma_file) if firma_file else img_to_bytes("/mnt/data/FIRMA PNG.png")
+            logo_bytes, firma_bytes, _ = _resolver_recursos_institucionales(
+                logo_file, firma_file, sello_file
+            )
 
             pdf_buf = generate_pdf(df_clean, m, pat_info, stu_info, phenotype,
                                    logo_bytes, firma_bytes, excluded)
